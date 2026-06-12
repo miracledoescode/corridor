@@ -33,6 +33,7 @@ type Adapter struct {
 	baseURL string
 	client  *ingest.Client
 	log     *slog.Logger
+	now     func() time.Time // injectable so fixture tests don't rot as dates pass
 }
 
 func New(baseURL, userAgent string, log *slog.Logger) *Adapter {
@@ -40,13 +41,21 @@ func New(baseURL, userAgent string, log *slog.Logger) *Adapter {
 		baseURL: strings.TrimRight(baseURL, "/"),
 		client:  ingest.NewClient(userAgent, requestsPerSecond),
 		log:     log.With("venue", slug),
+		now:     time.Now,
 	}
 }
 
 func (a *Adapter) Slug() string { return slug }
 
-// kalshiMarket is the subset of GET /markets we normalize. Prices are
-// integer cents (json.Number thanks to UseNumber — never float64).
+// kalshiMarket is the subset of GET /markets we normalize. Kalshi has
+// shipped two price encodings over time and we must parse BOTH:
+//   - legacy: integer cents (yes_bid: 57)
+//   - current: dollar strings with deci-cent precision (yes_bid_dollars:
+//     "0.5700") — this is what external-api returns as of 2026-06.
+//
+// The *_dollars strings win when present; cents are the fallback. All
+// values stay decimal text end-to-end (never float64; numbers decode as
+// json.Number).
 type kalshiMarket struct {
 	Ticker       string      `json:"ticker"`
 	Title        string      `json:"title"`
@@ -61,7 +70,22 @@ type kalshiMarket struct {
 	LastPrice    json.Number `json:"last_price"`
 	Volume24h    json.Number `json:"volume_24h"`
 	Liquidity    json.Number `json:"liquidity"`
+
+	YesBidDollars    string `json:"yes_bid_dollars"`
+	YesAskDollars    string `json:"yes_ask_dollars"`
+	NoBidDollars     string `json:"no_bid_dollars"`
+	NoAskDollars     string `json:"no_ask_dollars"`
+	LastPriceDollars string `json:"last_price_dollars"`
+	Volume24hFP      string `json:"volume_24h_fp"`
+	LiquidityDollars string `json:"liquidity_dollars"`
 }
+
+// isOpenStatus tolerates Kalshi's status-vocabulary drift: the GetMarkets
+// QUERY enum is still "open", but the RESPONSE now reports "active"
+// (older deployments said "open" in both places). Accepting only "open"
+// here silently dropped every market — the 2026-06-12 zero-ingest
+// incident.
+func isOpenStatus(s string) bool { return s == "active" || s == "open" }
 
 type marketsPage struct {
 	Cursor  string            `json:"cursor"`
@@ -103,11 +127,11 @@ func (a *Adapter) fetchPages(ctx context.Context, fn func(raw json.RawMessage, m
 func (a *Adapter) FetchMarkets(ctx context.Context) ([]ingest.Market, error) {
 	var out []ingest.Market
 	err := a.fetchPages(ctx, func(raw json.RawMessage, m kalshiMarket) {
-		if m.Ticker == "" || m.Status != "open" {
+		if m.Ticker == "" || !isOpenStatus(m.Status) {
 			return
 		}
 		closeTime, err := time.Parse(time.RFC3339, m.CloseTime)
-		if err != nil || !closeTime.After(time.Now()) {
+		if err != nil || !closeTime.After(a.now()) {
 			return
 		}
 		title := m.Title
@@ -119,7 +143,7 @@ func (a *Adapter) FetchMarkets(ctx context.Context) ([]ingest.Market, error) {
 			Title:              title,
 			ResolutionCriteria: m.RulesPrimary,
 			CloseTime:          &closeTime,
-			Status:             "active", // normalized from kalshi's "open"
+			Status:             "active", // normalized; kalshi says "active" (was "open")
 			Raw:                raw,
 			Outcomes: []ingest.Outcome{
 				{VenueOutcomeID: "yes", Label: "Yes"},
@@ -144,19 +168,28 @@ func (a *Adapter) FetchQuotes(ctx context.Context, venueMarketIDs []string) ([]i
 		want[id] = true
 	}
 
-	now := time.Now().UTC().Truncate(time.Second)
+	now := a.now().UTC().Truncate(time.Second)
 	var quotes []ingest.Quote
 	err := a.fetchPages(ctx, func(raw json.RawMessage, m kalshiMarket) {
 		if !want[m.Ticker] {
 			return
 		}
-		volume := string(m.Volume24h) // contracts traded; unitless count
-		// Kalshi reports liquidity in cents of resting dollar value;
-		// convert to dollars so the column is cross-venue comparable.
-		liquidity, err := centsToDollars(m.Liquidity, false)
-		if err != nil {
-			a.log.Warn("bad liquidity skipped", "ticker", m.Ticker, "err", err)
-			liquidity = ""
+		// Contracts traded; the _fp (fixed-point decimal string) form
+		// replaced the integer field in the current payload.
+		volume := m.Volume24hFP
+		if volume == "" {
+			volume = string(m.Volume24h)
+		}
+		// Liquidity: dollars string when present, else legacy integer
+		// cents converted to dollars — cross-venue comparable either way.
+		liquidity := m.LiquidityDollars
+		if liquidity == "" {
+			var err error
+			liquidity, err = centsToDollars(m.Liquidity, false)
+			if err != nil {
+				a.log.Warn("bad liquidity skipped", "ticker", m.Ticker, "err", err)
+				liquidity = ""
+			}
 		}
 		yes, no := quoteSides(m)
 		quotes = append(quotes,
@@ -177,21 +210,43 @@ func (a *Adapter) FetchQuotes(ctx context.Context, venueMarketIDs []string) ([]i
 
 type side struct{ bid, ask, last string }
 
-// quoteSides converts Kalshi's integer-cent prices to probability
-// strings. A price of 0 means "no order on that side of the book", so it
-// maps to NULL rather than a fake 0.00 quote; the raw payload keeps the
-// original zeros. last_price belongs to the yes side only.
+// quoteSides extracts top-of-book prices, preferring the current
+// *_dollars string fields and falling back to legacy integer cents.
+// A price of 0 (in either form) means "no order on that side of the
+// book", so it maps to NULL rather than a fake 0.00 quote; the raw
+// payload keeps the original zeros. last_price belongs to the yes side
+// only.
 func quoteSides(m kalshiMarket) (yes, no side) {
-	conv := func(n json.Number) string {
-		s, err := centsToDollars(n, true)
+	conv := func(dollars string, cents json.Number) string {
+		if dollars != "" {
+			if isZeroDecimal(dollars) {
+				return ""
+			}
+			return dollars
+		}
+		s, err := centsToDollars(cents, true)
 		if err != nil {
 			return ""
 		}
 		return s
 	}
-	yes = side{bid: conv(m.YesBid), ask: conv(m.YesAsk), last: conv(m.LastPrice)}
-	no = side{bid: conv(m.NoBid), ask: conv(m.NoAsk)}
+	yes = side{
+		bid:  conv(m.YesBidDollars, m.YesBid),
+		ask:  conv(m.YesAskDollars, m.YesAsk),
+		last: conv(m.LastPriceDollars, m.LastPrice),
+	}
+	no = side{
+		bid: conv(m.NoBidDollars, m.NoBid),
+		ask: conv(m.NoAskDollars, m.NoAsk),
+	}
 	return yes, no
+}
+
+// isZeroDecimal reports whether decimal text like "0", "0.00", "0.0000"
+// is numerically zero — by character inspection, never via float. Any
+// digit other than 0 means non-zero ("0.0020" → false).
+func isZeroDecimal(s string) bool {
+	return s != "" && strings.Trim(s, "0.") == ""
 }
 
 // centsToDollars turns an integer cent count into an exact decimal
