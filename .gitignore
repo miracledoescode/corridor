@@ -4,4 +4,7 @@
 # Build artifacts
 /bin/
 /backups/
-corridord
+# WHY the leading slash: a bare "corridord" also matches cmd/corridord/,
+# which silently kept the entire main package out of git — the fix(kalshi)
+# config change never shipped because of it. Anchored = binary only.
+/corridord

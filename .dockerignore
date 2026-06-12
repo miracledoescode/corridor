@@ -1,0 +1,10 @@
+# Keep secrets, VCS history, and non-build files out of the image build
+# context. .env especially: env_file injects it at RUN time; baking it
+# into the build context risks leaking it into layers.
+.env
+.git
+testdata/
+*.md
+backups/
+bin/
+corridord
