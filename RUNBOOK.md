@@ -15,7 +15,7 @@ Checklist, in order:
    root cause of the 2026-06 day-one outage.
 2. **Probe from the SAME network corridord runs on** (datacenter IPs can be
    treated differently from residential ones):
-   `curl -sS -H "User-Agent: CorridorBot/0.1 (contact: ...)" \
+   `curl -sS -H "User-Agent: CorridorBot/0.1 (contact: miraclesayscode@gmail.com)" \
       "https://external-api.kalshi.com/trade-api/v2/markets?limit=2"`
    - `200` + JSON → host fine; look at corridord logs for the real error.
    - `403` + Cloudflare/challenge HTML → bot/IP filtering of this network.
