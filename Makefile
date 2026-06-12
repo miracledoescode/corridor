@@ -13,8 +13,12 @@ up:
 down:
 	docker compose down
 
+# WHY the @version suffix: it runs the goose CLI in module-less mode, so
+# its extra DB drivers (mysql etc.) don't have to pollute our go.sum.
+# corridord also migrates itself at boot; this target is for migrating
+# without starting ingestion.
 migrate:
-	go run github.com/pressly/goose/v3/cmd/goose -dir migrations postgres "$(DB_URL)" up
+	go run github.com/pressly/goose/v3/cmd/goose@v3.27.1 -dir migrations postgres "$(DB_URL)" up
 
 verify:
 	docker compose exec -T db psql -U corridor -d corridor -c "\
