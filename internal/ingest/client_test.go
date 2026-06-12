@@ -88,13 +88,13 @@ func TestClientSendsIdentifiedUserAgent(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ua := UserAgent("ops@example.com")
+	ua := UserAgent("miraclesayscode@gmail.com")
 	c := NewClient(ua, 10000)
 	var out map[string]any
 	if err := c.GetJSON(context.Background(), srv.URL, &out); err != nil {
 		t.Fatal(err)
 	}
-	if gotUA != "CorridorBot/0.1 (contact: ops@example.com)" {
+	if gotUA != "CorridorBot/0.1 (contact: miraclesayscode@gmail.com)" {
 		t.Errorf("User-Agent = %q", gotUA)
 	}
 }
