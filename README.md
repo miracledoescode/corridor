@@ -141,4 +141,4 @@ See [Notion workspace](https://app.notion.com/p/11-Repo-Structure-DB-Schema-37cc
 ## License
 
 Proprietary. All rights reserved.
-© 2026 Miracle Mathew. Corridor labs
+© 2026 Miracle Mathew, Corridor Labs
