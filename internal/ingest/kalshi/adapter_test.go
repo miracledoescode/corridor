@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -41,6 +42,93 @@ func TestCentsToDollars(t *testing.T) {
 				t.Errorf("centsToDollars(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestParseLiveFixture is the regression test for the 2026-06-12
+// zero-ingest incident: the verbatim production payload (saved from a
+// live curl of external-api.kalshi.com) must parse into markets and
+// quotes. It locks in both breaking changes at once: response status
+// "active" (we only accepted "open") and *_dollars string prices (the
+// integer-cent fields we parsed are gone).
+func TestParseLiveFixture(t *testing.T) {
+	body, err := os.ReadFile("testdata/markets_live_2026-06-12.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fixture only carries a cursor for the next page; serve it once,
+	// then an empty page to terminate pagination.
+	served := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if served {
+			fmt.Fprint(w, `{"cursor":"","markets":[]}`)
+			return
+		}
+		served = true
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	a := newTestAdapter(t, srv.URL)
+	// Freeze the clock at capture time so the fixture's close_times stay
+	// "in the future" forever.
+	a.now = func() time.Time { return time.Date(2026, 6, 12, 20, 5, 0, 0, time.UTC) }
+
+	markets, err := a.FetchMarkets(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(markets) != 2 {
+		t.Fatalf("got %d markets from live payload, want 2", len(markets))
+	}
+	for _, m := range markets {
+		if m.Status != "active" || len(m.Outcomes) != 2 || m.Raw == nil {
+			t.Errorf("market %s not normalized: status=%q outcomes=%d raw=%v",
+				m.VenueMarketID, m.Status, len(m.Outcomes), m.Raw != nil)
+		}
+	}
+
+	served = false
+	mlb := "KXMVESPORTSMULTIGAMEEXTENDED-S2026DF7EF4475C3-20067410492"
+	quotes, err := a.FetchQuotes(context.Background(), []string{mlb})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(quotes) != 2 {
+		t.Fatalf("got %d quotes, want 2 (yes+no)", len(quotes))
+	}
+	byOutcome := map[string]ingest.Quote{}
+	for _, q := range quotes {
+		byOutcome[q.VenueOutcomeID] = q
+	}
+	yes := byOutcome["yes"]
+	// yes_bid_dollars "0.0000" = empty book side → NULL; ask is a real
+	// deci-cent price and must survive verbatim.
+	if yes.Bid != "" || yes.Ask != "0.0020" || yes.Last != "" {
+		t.Errorf("yes side = %q/%q/%q, want NULL/0.0020/NULL", yes.Bid, yes.Ask, yes.Last)
+	}
+	no := byOutcome["no"]
+	if no.Bid != "0.9980" || no.Ask != "1.0000" {
+		t.Errorf("no side = %q/%q, want 0.9980/1.0000", no.Bid, no.Ask)
+	}
+	if yes.Volume24h != "0.00" || yes.Liquidity != "0.0000" {
+		t.Errorf("stats = vol %q liq %q, want 0.00 / 0.0000 (fp/dollars fields)", yes.Volume24h, yes.Liquidity)
+	}
+}
+
+func TestIsZeroDecimal(t *testing.T) {
+	tests := []struct {
+		in   string
+		want bool
+	}{
+		{"0", true}, {"0.00", true}, {"0.0000", true}, {"000.0", true},
+		{"0.0020", false}, {"1.0000", false}, {"0.5700", false}, {"", false},
+	}
+	for _, tt := range tests {
+		if got := isZeroDecimal(tt.in); got != tt.want {
+			t.Errorf("isZeroDecimal(%q) = %v, want %v", tt.in, got, tt.want)
+		}
 	}
 }
 
