@@ -3,7 +3,7 @@
 > **Google Flights for prediction markets.**
 > Compare event odds across every venue. Catch the spread before anyone else does.
 
-Corridor is a price-comparison and arbitrage-alert layer across prediction
+Corridor is a AI-native price-comparison and arbitrage-alert layer across prediction
 market venues — Polymarket, Kalshi, Bayse, and more. The same real-world
 event trades at different prices on every platform. Corridor finds the gap.
 
@@ -134,7 +134,7 @@ corridor/
 ## Status
 
 **Phase 1 — Ingestion spine:** in progress
-See [Notion workspace](https://app.notion.com/p/11-Repo-Structure-DB-Schema-37cc4b1c8bb081a9a701f4d21e272bf1?source=copy_link) for full product spec, roadmap, and decisions log.
+See [Notion workspace](https://app.notion.com/p/Corridor-Google-Flights-for-Prediction-Markets-37bc4b1c8bb081b5ab4af003519021eb?source=copy_link) for full product spec, roadmap, and decisions log.
 
 ---
 
