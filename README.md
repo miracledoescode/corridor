@@ -13,9 +13,10 @@ event trades at different prices on every platform. Corridor finds the gap.
 
 | Feature | Status |
 |---|---|
-| Live odds comparison across venues | 🔨 Building |
-| Cross-venue arbitrage alerts (Telegram) | 🔨 Building |
-| African venue coverage (Bayse, OpinionMarket) | 🔨 Building |
+| Live odds ingestion (Polymarket + Kalshi) | ✅ Live |
+| Cross-venue event matching | 🔨 Building (Phase 2) |
+| Cross-venue arbitrage alerts (Telegram) | 📅 Planned (Phase 3) |
+| African venue coverage (Bayse, OpinionMarket) | 📅 Planned |
 | Historical odds API | 📅 Planned |
 | Trade routing | 📅 Planned |
 
@@ -133,7 +134,25 @@ corridor/
 
 ## Status
 
-**Phase 1 — Ingestion spine:** in progress
+**Phase 1 — Ingestion spine: ✅ complete.** Polymarket + Kalshi adapters live,
+supervised goroutine-per-venue with backoff restarts, `/healthz`, idempotent
+upserts into Postgres 16 + TimescaleDB, raw payloads preserved in JSONB.
+Verified in production: both venues ingesting, lag < 20s, venue isolation
+proven under a real outage. See [`RUNBOOK.md`](./RUNBOOK.md) for venue
+reachability + on-call notes.
+
+| Phase | Scope | Status |
+|---|---|---|
+| 1 — Ingestion spine | Polymarket + Kalshi → TimescaleDB, `/healthz` | ✅ complete |
+| 1b — Bayse adapter | Nigeria/Africa venue coverage | 📅 next |
+| 2 — Matching engine | `match/` Python: embed → LLM pair → resolution diff | 🔨 starting |
+| 3 — Spread + notify | Fee/FX-adjusted arb detection, Telegram alerts | 📅 planned |
+| 4 — Web | Static odds-comparison page on Cloudflare Pages | 📅 planned |
+
+Next: provision an always-on host (Oracle ARM / Hetzner), deploy `corridord`,
+nightly `backup.sh` → R2 with a proven restore, then build Phases 2–4 against
+the live database.
+
 See [Notion workspace](https://app.notion.com/p/Corridor-Google-Flights-for-Prediction-Markets-37bc4b1c8bb081b5ab4af003519021eb?source=copy_link) for full product spec, roadmap, and decisions log.
 
 ---
