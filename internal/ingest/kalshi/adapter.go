@@ -28,6 +28,24 @@ const (
 	maxPages = 5
 )
 
+// scopedSeries is the v0 allowlist — the structural fix for the
+// 2026-06-15 disk-full incident (166K combinatorial markets in
+// KXMVESPORTSMULTIGAMEEXTENDED + KXMVECROSSCATEGORY filled the disk).
+// Only these series are ingested; everything else is refused.
+//
+// Each series is here because it has a confirmed Polymarket counterpart
+// (winner / top scorer / group winner / advancement) — i.e. it can
+// actually produce a cross-venue arb. Counts verified live 2026-06-15.
+//
+// Hardcoded is fine at v0 (5 series, changes rarely). Move to config/env
+// when scope churn or no-redeploy changes justify it.
+var scopedSeries = []string{
+	"KXWCSTAGE",      // 35 — furthest stage / winner ↔ "[country] win the World Cup"
+	"KXWCGOALLEADER", // 41 — top scorer             ↔ "[player] top goalscorer"
+	"KXWCGROUPWIN",   // 48 — group winner           ↔ "[country] win Group X"
+	"KXWCGROUPQUAL",  // 48 — advancement            ↔ "advance to knockout stages"
+}
+
 // Adapter implements ingest.Adapter for Kalshi.
 type Adapter struct {
 	baseURL string
@@ -92,18 +110,24 @@ type marketsPage struct {
 	Markets []json.RawMessage `json:"markets"`
 }
 
-// fetchPages walks GET /markets?status=open with cursor pagination and
-// hands every raw market element to fn.
-func (a *Adapter) fetchPages(ctx context.Context, fn func(raw json.RawMessage, m kalshiMarket)) error {
+// fetchSeriesPages walks GET /markets?status=open&series_ticker=<series>
+// with cursor pagination and hands every raw market element to fn.
+// It returns a non-nil error if the fetch fails; the caller must decide
+// whether to abort or continue to the next series.
+func (a *Adapter) fetchSeriesPages(ctx context.Context, series string, fn func(raw json.RawMessage, m kalshiMarket)) error {
+	if series == "" {
+		return fmt.Errorf("series cannot be empty")
+	}
 	cursor := ""
 	for page := 0; page < maxPages; page++ {
-		u := fmt.Sprintf("%s/markets?limit=%d&status=open", a.baseURL, pageSize)
+		u := fmt.Sprintf("%s/markets?limit=%d&status=open&series_ticker=%s",
+			a.baseURL, pageSize, url.QueryEscape(series))
 		if cursor != "" {
 			u += "&cursor=" + url.QueryEscape(cursor)
 		}
 		var p marketsPage
 		if err := a.client.GetJSON(ctx, u, &p); err != nil {
-			return fmt.Errorf("kalshi markets page %d: %w", page, err)
+			return fmt.Errorf("kalshi series %s page %d: %w", series, page, err)
 		}
 		for _, raw := range p.Markets {
 			var m kalshiMarket
@@ -117,6 +141,26 @@ func (a *Adapter) fetchPages(ctx context.Context, fn func(raw json.RawMessage, m
 			return nil
 		}
 		cursor = p.Cursor
+	}
+	return nil
+}
+
+// fetchPages loops over scopedSeries, calling fetchSeriesPages for each.
+// If scopedSeries is empty, it logs a warning and returns nil (no fetch).
+// If one series fails, it logs a warning and continues to the next series;
+// the final error is nil (series isolation).
+func (a *Adapter) fetchPages(ctx context.Context, fn func(raw json.RawMessage, m kalshiMarket)) error {
+	if len(scopedSeries) == 0 {
+		a.log.Warn("scopedSeries is empty; refusing unfiltered sweep to prevent disk-full")
+		return nil
+	}
+	for _, series := range scopedSeries {
+		if err := a.fetchSeriesPages(ctx, series, fn); err != nil {
+			a.log.Warn("series fetch failed, continuing to next series",
+				"series", series, "err", err)
+			// Do not abort; one series failing must not affect others.
+			continue
+		}
 	}
 	return nil
 }
