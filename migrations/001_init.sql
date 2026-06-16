@@ -5,7 +5,14 @@
 -- migration series, and empty tables cost nothing at runtime.
 
 -- +goose Up
-CREATE EXTENSION IF NOT EXISTS timescaledb;
+-- WHY no timescaledb: prod runs on Supabase managed Postgres, which offers
+-- pgvector but NOT the timescaledb extension. Plain Postgres is the common
+-- denominator so the SAME migration runs clean on both Supabase and local
+-- docker. The quotes/fx_rates "hypertables" are now ordinary tables; the
+-- (outcome_id, time DESC) index below gives us the time-ordered lookups we
+-- relied on the hypertable's chunk indexes for. At Phase-1 volumes a plain
+-- B-tree is plenty; if row counts ever demand partitioning we revisit with
+-- native Postgres declarative partitioning (no extension required).
 CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE venues (
@@ -61,12 +68,12 @@ CREATE TABLE quotes (
     liquidity  NUMERIC,
     raw        JSONB
 );
-SELECT create_hypertable('quotes', 'time');
 -- WHY unique: the idempotency hard rule — a retry inserting the same
 -- (outcome, timestamp) snapshot must be a no-op, never a duplicate row.
--- The same index satisfies the required (outcome_id, time DESC) lookup.
--- TimescaleDB allows it because the partition column (time) is included.
-CREATE UNIQUE INDEX quotes_outcome_time_idx ON quotes (outcome_id, time DESC);
+-- This UNIQUE index also serves the (outcome_id, time DESC) read path, so
+-- it is strictly stronger than a plain index on the same columns — we keep
+-- the unique form rather than add a redundant non-unique one.
+CREATE UNIQUE INDEX IF NOT EXISTS quotes_outcome_time_idx ON quotes (outcome_id, time DESC);
 
 CREATE TABLE market_matches (
     id                BIGSERIAL PRIMARY KEY,
@@ -87,8 +94,7 @@ CREATE TABLE fx_rates (
     rate   NUMERIC NOT NULL,
     source TEXT NOT NULL
 );
-SELECT create_hypertable('fx_rates', 'time');
-CREATE UNIQUE INDEX fx_rates_pair_source_time_idx ON fx_rates (pair, source, time DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS fx_rates_pair_source_time_idx ON fx_rates (pair, source, time DESC);
 
 CREATE TABLE alerts (
     id            BIGSERIAL PRIMARY KEY,
