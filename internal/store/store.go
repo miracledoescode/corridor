@@ -11,9 +11,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
-	_ "github.com/jackc/pgx/v5/stdlib" // database/sql driver for goose
+	"github.com/jackc/pgx/v5/stdlib" // database/sql driver for goose
 	"github.com/pressly/goose/v3"
 
 	"github.com/miracledoescode/corridor/internal/cache"
@@ -35,8 +36,39 @@ type Store struct {
 	venueIDs map[string]int16 // slug → venues.id; immutable rows, safe to cache
 }
 
+// maxPoolConns caps concurrent connections corridord opens.
+//
+// WHY a cap, and WHY the pooler: prod is Supabase. Connect via the
+// transaction POOLER (host ...pooler.supabase.com, port 6543), never the
+// direct port-5432 endpoint. The supervisor opens a connection per venue
+// plus migration/health traffic, and Supabase's direct endpoint allows
+// only a few dozen total server connections — a handful of restarting
+// services would exhaust them and stall ingestion (a prime-directive
+// violation). The pooler multiplexes our pool over a small set of real
+// backends, so 15 app-side conns is comfortable and predictable. We honor
+// a lower pool_max_conns from the URL but never exceed this ceiling.
+const maxPoolConns = 15
+
 func New(ctx context.Context, dbURL string, log *slog.Logger) (*Store, error) {
-	pool, err := pgxpool.New(ctx, dbURL)
+	cfg, err := pgxpool.ParseConfig(dbURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse db url: %w", err)
+	}
+	if cfg.MaxConns <= 0 || cfg.MaxConns > maxPoolConns {
+		cfg.MaxConns = maxPoolConns
+	}
+	// WHY QueryExecModeDescribeExec: the transaction pooler hands each
+	// query a possibly-different backend, so server-side prepared
+	// statements cached by name (pgx's default) break with "prepared
+	// statement does not exist". DescribeExec uses the extended protocol
+	// and re-describes each statement instead of caching one by name —
+	// pooler-safe. Crucially it still asks the server for column types, so
+	// our JSONB `raw` parameter is encoded correctly (plain Exec mode skips
+	// the describe and mis-encodes []byte into jsonb). Same behavior
+	// against a direct/local connection, just without the cache win.
+	cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeDescribeExec
+
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("pgx pool: %w", err)
 	}
@@ -57,10 +89,16 @@ func (s *Store) Close() { s.pool.Close() }
 // Migrate runs the embedded goose migrations. Goose tracks applied
 // versions, so calling this on every boot is idempotent.
 func Migrate(dbURL string) error {
-	db, err := sql.Open("pgx", dbURL)
+	// Same pooler-safety as the runtime pool: goose runs DDL through
+	// database/sql, which also caches prepared statements by default and
+	// would break behind the Supabase transaction pooler. Register a pgx
+	// conn config in DescribeExec mode and open database/sql against that.
+	connCfg, err := pgx.ParseConfig(dbURL)
 	if err != nil {
 		return err
 	}
+	connCfg.DefaultQueryExecMode = pgx.QueryExecModeDescribeExec
+	db := sql.OpenDB(stdlib.GetConnector(*connCfg))
 	defer db.Close()
 	goose.SetBaseFS(migrations.FS)
 	if err := goose.SetDialect("postgres"); err != nil {
