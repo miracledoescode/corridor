@@ -37,6 +37,14 @@ the same goose migrations run on Supabase and local docker. RLS is enabled on
 all public tables (migration `002`); corridord connects as the owner role and
 bypasses RLS, so ingestion is unaffected.
 
+### Topology
+docker-compose runs only `redis` (a throwaway top-of-book sidecar) and
+`corridord`. There is NO local Postgres service — Supabase is the database.
+corridord reads `DB_URL` from `.env`; `make verify` / `make backup` /
+`make migrate` all target that same `DB_URL`, so tooling can't drift to a
+different DB than the one corridord writes. Local/offline dev = bring your
+own Postgres and point `DB_URL` at it.
+
 ### Connection string
 - Use the **transaction POOLER** endpoint: host `...pooler.supabase.com`,
   **port 6543** — NOT the direct `:5432`. The direct endpoint's low
