@@ -17,8 +17,13 @@ down:
 # its extra DB drivers (mysql etc.) don't have to pollute our go.sum.
 # corridord also migrates itself at boot; this target is for migrating
 # without starting ingestion.
+# WHY the leading @ on the recipe: make echoes each recipe line before
+# running it, which would print the expanded DB_URL — including the
+# password — to the terminal (and into any shared transcript). @ suppresses
+# that echo; psql/pg_dump/goose still run and still show their own output.
+# Same reason verify/backup below are silenced. (No secrets in logs.)
 migrate:
-	go run github.com/pressly/goose/v3/cmd/goose@v3.27.1 -dir migrations postgres "$(DB_URL)" up
+	@go run github.com/pressly/goose/v3/cmd/goose@v3.27.1 -dir migrations postgres "$(DB_URL)" up
 
 # verify/backup talk to DB_URL directly (Supabase) — the same database
 # corridord writes to — so they can never drift to a different DB. Requires
@@ -28,7 +33,7 @@ migrate:
 # with stable prices writes no quotes for minutes. last_price_change is shown
 # separately and may legitimately be old — it is NOT a health signal.
 verify:
-	psql "$(DB_URL)" -c "\
+	@psql "$(DB_URL)" -c "\
 	SELECT v.slug, \
 	       COUNT(DISTINCT m.id) AS markets, \
 	       COUNT(q.time)        AS quotes, \
@@ -48,8 +53,8 @@ run:
 	go run ./cmd/corridord
 
 backup:
-	mkdir -p backups
-	pg_dump "$(DB_URL)" -Fc > backups/corridor_$$(date +%Y%m%dT%H%M%S).dump
+	@mkdir -p backups
+	@pg_dump "$(DB_URL)" -Fc > backups/corridor_$$(date +%Y%m%dT%H%M%S).dump
 
 # Regenerate internal/store/gen from the .sql query files.
 # WHY pinned via go run: no global install needed; everyone gets the same
