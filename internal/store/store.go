@@ -250,7 +250,13 @@ func quoteParams(venueSlug string, qt ingest.Quote) (gen.InsertQuoteParams, erro
 		return p, fmt.Errorf("liquidity: %w", err)
 	}
 	p.Time = pgtype.Timestamptz{Time: qt.Time.UTC(), Valid: true}
-	p.Raw = qt.Raw
+	// WHY no raw on quotes: the per-quote raw JSONB payload was ~90% of the
+	// quotes table's storage (508MB/day, over the Supabase free tier) and is
+	// never read — the trusted parser already extracts bid/ask/last/volume/
+	// liquidity into typed columns. We leave the column in the schema but
+	// write NULL. markets.raw STAYS: re-parsing market metadata has real
+	// value and that table is tiny by comparison.
+	p.Raw = nil
 	p.VenueSlug = venueSlug
 	p.VenueMarketID = qt.VenueMarketID
 	p.VenueOutcomeID = qt.VenueOutcomeID
@@ -260,6 +266,23 @@ func quoteParams(venueSlug string, qt ingest.Quote) (gen.InsertQuoteParams, erro
 // ActiveMarketIDs implements ingest.Sink.
 func (s *Store) ActiveMarketIDs(ctx context.Context, venueSlug string) ([]string, error) {
 	return s.q.ActiveMarketIDs(ctx, venueSlug)
+}
+
+// DeleteQuotesOlderThan removes quote rows older than days and returns how
+// many were deleted. Used by the retention job to keep the quotes table
+// within the Supabase free-tier storage cap.
+//
+// WHY make_interval over '($1 || ” days”)::interval: it takes the day
+// count as an integer parameter directly — no string concatenation, and it
+// rides the pool's simple-protocol mode cleanly (the arg is formatted
+// inline by pgx, no prepared statement for the pooler to lose).
+func (s *Store) DeleteQuotesOlderThan(ctx context.Context, days int) (int64, error) {
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM quotes WHERE time < now() - make_interval(days => $1)`, days)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 // VenueLag reports the newest quote per venue for /healthz.

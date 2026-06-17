@@ -99,6 +99,47 @@ func TestIdempotentIngest(t *testing.T) {
 		t.Errorf("bid round-trip = %q, want 0.57000", bid)
 	}
 
+	// quotes.raw must be NULL even though the source Quote carried a payload:
+	// we stopped storing per-quote raw to stay under the storage cap.
+	var rawNull bool
+	err = st.pool.QueryRow(ctx,
+		`SELECT raw IS NULL FROM quotes q JOIN outcomes o ON o.id = q.outcome_id
+		 WHERE o.venue_outcome_id = 'itest-yes' ORDER BY q.time DESC LIMIT 1`).Scan(&rawNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rawNull {
+		t.Error("quotes.raw should be NULL (raw payload no longer stored)")
+	}
+
+	// Retention: a quote older than the cutoff is pruned, a fresh one is kept.
+	old := ingest.Quote{
+		VenueMarketID:  "itest-market-1",
+		VenueOutcomeID: "itest-yes",
+		Time:           time.Now().Add(-10 * 24 * time.Hour).UTC().Truncate(time.Second),
+		Bid:            "0.10",
+	}
+	if _, err := st.InsertQuotes(ctx, "polymarket", []ingest.Quote{old}); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := st.DeleteQuotesOlderThan(ctx, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted < 1 {
+		t.Errorf("retention deleted %d rows, want >=1 (the 10-day-old quote)", deleted)
+	}
+	var remaining int
+	err = st.pool.QueryRow(ctx,
+		`SELECT count(*) FROM quotes q JOIN outcomes o ON o.id = q.outcome_id
+		 WHERE o.venue_outcome_id = 'itest-yes'`).Scan(&remaining)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 1 { // only the fresh quote survives
+		t.Errorf("after retention %d quotes remain, want 1 (the fresh one)", remaining)
+	}
+
 	// Cleanup so repeated test runs stay deterministic.
 	_, _ = st.pool.Exec(ctx, `DELETE FROM quotes WHERE outcome_id IN
 		(SELECT id FROM outcomes WHERE venue_outcome_id LIKE 'itest-%')`)
