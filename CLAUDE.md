@@ -14,7 +14,11 @@ data stored.
 ## Architecture (do not deviate without asking)
 - Modular monolith, one repo. Go binary `corridord` = ingest + spread +
   notify + api. Python `match/` = batch jobs, not a service.
-- Postgres 16 + TimescaleDB + pgvector. Redis = live top-of-book only.
+- Supabase managed Postgres + pgvector (plain-Postgres schema, NO
+  TimescaleDB — Supabase doesn't offer it; quotes/fx_rates are ordinary
+  tables with time-ordered indexes). Redis = live top-of-book only.
+  Connect via the transaction POOLER (:6543) in pgx simple-protocol mode —
+  see RUNBOOK.md before touching connection code.
 - Raw venue payloads ALWAYS stored in JSONB next to normalized rows.
 - One adapter per venue: FetchMarkets / FetchQuotes / Health.
 - Venue isolation: supervised goroutine per venue, backoff restarts — one
@@ -40,11 +44,14 @@ I am learning while building. For every non-obvious decision, add a short
 "WHY:" paragraph in the PR description or comment. Teach, don't dumb down.
 
 ## Current phase
-Phase 1: ingestion spine (Polymarket + Kalshi). Do NOT build the matcher,
-spread engine, Telegram bot, or web ahead of phase.
+Phase 1 (ingestion spine: Polymarket + Kalshi): ✅ DONE — live on prod
+(Supabase), both venues ingesting, RLS on, verified against the live DB.
 
-Phase 2: the matching engine in match/ (Python, uv). Goal: fill
-markets.event_id and market_matches.
+Phase 2 is CURRENT: the matching engine in match/ (Python, uv). Goal: fill
+markets.event_id and market_matches. Do NOT build the spread engine,
+Telegram bot, or web ahead of phase. Still-open Phase-1 ops carried
+forward: an always-on host for corridord, and nightly backup.sh with a
+proven restore.
 
 Pipeline:
 1. embed.py — sentence-transformers (bge-small-en-v1.5, 384-dim) over
