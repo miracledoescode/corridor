@@ -75,6 +75,11 @@ func TestParseLiveFixture(t *testing.T) {
 	// "in the future" forever.
 	a.now = func() time.Time { return time.Date(2026, 6, 12, 20, 5, 0, 0, time.UTC) }
 
+	// Temporarily set scopedSeries for this test
+	originalScoped := scopedSeries
+	scopedSeries = []string{"KXMVESPORTSMULTIGAMEEXTENDED"}
+	defer func() { scopedSeries = originalScoped }()
+
 	markets, err := a.FetchMarkets(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -179,6 +184,12 @@ func TestFetchMarkets(t *testing.T) {
 	defer srv.Close()
 
 	a := newTestAdapter(t, srv.URL)
+
+	// Temporarily set scopedSeries for this test
+	originalScoped := scopedSeries
+	scopedSeries = []string{"TEST-SERIES"}
+	defer func() { scopedSeries = originalScoped }()
+
 	markets, err := a.FetchMarkets(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -209,6 +220,12 @@ func TestFetchQuotes(t *testing.T) {
 	defer srv.Close()
 
 	a := newTestAdapter(t, srv.URL)
+
+	// Temporarily set scopedSeries for this test
+	originalScoped := scopedSeries
+	scopedSeries = []string{"TEST-SERIES"}
+	defer func() { scopedSeries = originalScoped }()
+
 	quotes, err := a.FetchQuotes(context.Background(), []string{"INX-26DEC31", "EMPTYBOOK"})
 	if err != nil {
 		t.Fatal(err)
@@ -237,5 +254,69 @@ func TestFetchQuotes(t *testing.T) {
 	empty := byKey["EMPTYBOOK/yes"]
 	if empty.Bid != "" || empty.Ask != "" || empty.Last != "" {
 		t.Errorf("empty book must be NULLs, got %q/%q/%q", empty.Bid, empty.Ask, empty.Last)
+	}
+}
+
+func TestScopedSeriesEmptyPreventsFetch(t *testing.T) {
+	// Ensure that an empty scopedSeries results in zero fetches and no error.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request to %s %s when scopedSeries is empty", r.Method, r.URL.Path)
+		http.Error(w, "should not be called", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	a := newTestAdapter(t, srv.URL)
+	// scopedSeries is already empty by default
+
+	// FetchMarkets should return no error and no markets
+	markets, err := a.FetchMarkets(context.Background())
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if len(markets) != 0 {
+		t.Fatalf("expected 0 markets with empty scopedSeries, got %d", len(markets))
+	}
+}
+
+func TestScopedSeriesOneFailureDoesNotBlockOthers(t *testing.T) {
+	// Verify that if one series fails, others still run.
+	callCount := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/markets" {
+			http.NotFound(w, r)
+			return
+		}
+		series := r.URL.Query().Get("series_ticker")
+		callCount[series]++
+
+		// First series fails; second succeeds
+		if series == "FAIL-SERIES" {
+			http.Error(w, "series not found", http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"cursor":"","markets":[]}`)
+	}))
+	defer srv.Close()
+
+	a := newTestAdapter(t, srv.URL)
+	// Temporarily override scopedSeries for this test
+	originalScoped := scopedSeries
+	scopedSeries = []string{"FAIL-SERIES", "GOOD-SERIES"}
+	defer func() { scopedSeries = originalScoped }()
+
+	_, err := a.FetchMarkets(context.Background())
+	// Should not error; should have logged a warning for the failing series
+	if err != nil {
+		t.Fatalf("expected no error despite one series failing, got %v", err)
+	}
+
+	// Both series should have been attempted
+	if callCount["FAIL-SERIES"] != 1 {
+		t.Errorf("FAIL-SERIES call count = %d, want 1", callCount["FAIL-SERIES"])
+	}
+	if callCount["GOOD-SERIES"] != 1 {
+		t.Errorf("GOOD-SERIES call count = %d, want 1", callCount["GOOD-SERIES"])
 	}
 }
