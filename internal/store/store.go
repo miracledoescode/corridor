@@ -57,16 +57,29 @@ func New(ctx context.Context, dbURL string, log *slog.Logger) (*Store, error) {
 	if cfg.MaxConns <= 0 || cfg.MaxConns > maxPoolConns {
 		cfg.MaxConns = maxPoolConns
 	}
-	// WHY QueryExecModeDescribeExec: the transaction pooler hands each
-	// query a possibly-different backend, so server-side prepared
-	// statements cached by name (pgx's default) break with "prepared
-	// statement does not exist". DescribeExec uses the extended protocol
-	// and re-describes each statement instead of caching one by name —
-	// pooler-safe. Crucially it still asks the server for column types, so
-	// our JSONB `raw` parameter is encoded correctly (plain Exec mode skips
-	// the describe and mis-encodes []byte into jsonb). Same behavior
-	// against a direct/local connection, just without the cache win.
-	cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeDescribeExec
+	// WHY simple protocol: prod runs behind Supabase's TRANSACTION-mode
+	// pooler (port 6543), which does not guarantee that successive round
+	// trips on one logical connection land on the same backend. pgx's
+	// default mode (and the describe/exec modes) lean on server-side
+	// prepared statements — a statement is prepared on backend A, then the
+	// pooler routes the execute to backend B where it doesn't exist:
+	// "unnamed prepared statement does not exist" (SQLSTATE 26000), which
+	// is exactly what crashed the Kalshi sweep on cutover. Simple protocol
+	// uses NO prepared statements at all — one Query message with the args
+	// formatted (safely, pgx-escaped) inline — so there is nothing for the
+	// pooler to lose between trips. The cost is no binary format / no
+	// server-side statement reuse; fine for a write-heavy ingest path.
+	cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	// WHY this hook: simple protocol can't ask the server for a parameter's
+	// type, so pgx infers it from the Go value — and a Go []byte defaults to
+	// bytea, which corrupts our jsonb `raw` columns (markets.raw, quotes.raw
+	// — the only []byte arguments we send). Registering []byte as jsonb makes
+	// the encoding correct. Safe because we have zero bytea columns. Runs on
+	// every pooled connection at creation; connection-init only.
+	cfg.AfterConnect = func(_ context.Context, conn *pgx.Conn) error {
+		conn.TypeMap().RegisterDefaultPgType([]byte(nil), "jsonb")
+		return nil
+	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
@@ -90,14 +103,16 @@ func (s *Store) Close() { s.pool.Close() }
 // versions, so calling this on every boot is idempotent.
 func Migrate(dbURL string) error {
 	// Same pooler-safety as the runtime pool: goose runs DDL through
-	// database/sql, which also caches prepared statements by default and
-	// would break behind the Supabase transaction pooler. Register a pgx
-	// conn config in DescribeExec mode and open database/sql against that.
+	// database/sql, which also leans on prepared statements by default and
+	// would hit the same 26000 behind the Supabase transaction pooler. Open
+	// database/sql via a pgx conn config in simple-protocol mode. No jsonb
+	// params here (migrations are DDL + integer/timestamp version rows), so
+	// the []byte->jsonb hook the runtime pool needs is unnecessary.
 	connCfg, err := pgx.ParseConfig(dbURL)
 	if err != nil {
 		return err
 	}
-	connCfg.DefaultQueryExecMode = pgx.QueryExecModeDescribeExec
+	connCfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
 	db := sql.OpenDB(stdlib.GetConnector(*connCfg))
 	defer db.Close()
 	goose.SetBaseFS(migrations.FS)
