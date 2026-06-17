@@ -62,3 +62,58 @@ func (q *Queries) InsertQuote(ctx context.Context, arg InsertQuoteParams) (int64
 	}
 	return result.RowsAffected(), nil
 }
+
+const latestQuotePerOutcome = `-- name: LatestQuotePerOutcome :many
+SELECT DISTINCT ON (q.outcome_id)
+       v.slug             AS venue_slug,
+       m.venue_market_id  AS venue_market_id,
+       o.venue_outcome_id AS venue_outcome_id,
+       COALESCE(q.bid::text, '')::text  AS bid,
+       COALESCE(q.ask::text, '')::text  AS ask,
+       COALESCE(q.last::text, '')::text AS last
+FROM quotes q
+JOIN outcomes o ON o.id = q.outcome_id
+JOIN markets m  ON m.id = o.market_id
+JOIN venues v   ON v.id = m.venue_id
+ORDER BY q.outcome_id, q.time DESC
+`
+
+type LatestQuotePerOutcomeRow struct {
+	VenueSlug      string
+	VenueMarketID  string
+	VenueOutcomeID string
+	Bid            string
+	Ask            string
+	Last           string
+}
+
+// Newest stored price per outcome, with the venue/market/outcome identifiers
+// the write path keys on. Used once at startup to warm the in-memory dedup
+// cache so a restart does not re-write a duplicate row for every outcome on
+// the first poll. ::text yields the canonical NUMERIC text (NULL stays NULL).
+func (q *Queries) LatestQuotePerOutcome(ctx context.Context) ([]LatestQuotePerOutcomeRow, error) {
+	rows, err := q.db.Query(ctx, latestQuotePerOutcome)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []LatestQuotePerOutcomeRow
+	for rows.Next() {
+		var i LatestQuotePerOutcomeRow
+		if err := rows.Scan(
+			&i.VenueSlug,
+			&i.VenueMarketID,
+			&i.VenueOutcomeID,
+			&i.Bid,
+			&i.Ask,
+			&i.Last,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}

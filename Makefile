@@ -23,18 +23,23 @@ migrate:
 # verify/backup talk to DB_URL directly (Supabase) — the same database
 # corridord writes to — so they can never drift to a different DB. Requires
 # psql/pg_dump on the host (present in the Codespace / dev image).
+# lag_seconds is measured from the venue HEARTBEAT (last_polled_at), not
+# MAX(quote time): quotes are deduped to price changes, so a healthy venue
+# with stable prices writes no quotes for minutes. last_price_change is shown
+# separately and may legitimately be old — it is NOT a health signal.
 verify:
 	psql "$(DB_URL)" -c "\
 	SELECT v.slug, \
 	       COUNT(DISTINCT m.id) AS markets, \
 	       COUNT(q.time)        AS quotes, \
-	       MAX(q.time)          AS newest_quote, \
-	       EXTRACT(EPOCH FROM (now() - MAX(q.time)))::int AS lag_seconds \
+	       MAX(q.time)          AS last_price_change, \
+	       v.last_polled_at     AS last_polled, \
+	       EXTRACT(EPOCH FROM (now() - v.last_polled_at))::int AS lag_seconds \
 	FROM venues v \
 	LEFT JOIN markets m  ON m.venue_id  = v.id \
 	LEFT JOIN outcomes o ON o.market_id = m.id \
 	LEFT JOIN quotes q   ON q.outcome_id = o.id \
-	GROUP BY v.slug;"
+	GROUP BY v.slug, v.last_polled_at;"
 
 test:
 	go test ./...

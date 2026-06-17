@@ -15,12 +15,17 @@ type Sink interface {
 	// UpsertMarkets persists markets + outcomes idempotently and returns
 	// how many markets were written.
 	UpsertMarkets(ctx context.Context, venueSlug string, markets []Market) (int, error)
-	// InsertQuotes persists quote snapshots (duplicates are no-ops) and
-	// returns how many rows were actually inserted.
+	// InsertQuotes persists quote snapshots and returns how many rows were
+	// actually written. Unchanged prices are deduped away, so the return is
+	// "rows written", which is <= len(quotes).
 	InsertQuotes(ctx context.Context, venueSlug string, quotes []Quote) (int, error)
 	// ActiveMarketIDs returns the venue_market_ids currently worth
 	// quoting: status=active with close_time in the future or unknown.
 	ActiveMarketIDs(ctx context.Context, venueSlug string) ([]string, error)
+	// MarkVenuePolled stamps the venue's liveness heartbeat. Called once per
+	// quote cycle so health can distinguish a stable-price venue (no new
+	// quotes, still healthy) from a dead one.
+	MarkVenuePolled(ctx context.Context, venueSlug string) error
 }
 
 // VenueStatus is the supervisor's in-memory view of one venue loop,
@@ -155,11 +160,11 @@ func (s *Supervisor) runVenueOnce(ctx context.Context, v VenueSpec, log *slog.Lo
 	if err != nil {
 		return fmt.Errorf("metadata poll: %w", err)
 	}
-	quoteCount, err := s.pollQuotes(ctx, v.Adapter)
+	polled, wrote, err := s.pollQuotes(ctx, v.Adapter)
 	if err != nil {
 		return fmt.Errorf("quote poll: %w", err)
 	}
-	log.Info("poll cycle", "markets", marketCount, "quotes", quoteCount)
+	log.Info("poll cycle", "markets", marketCount, "polled", polled, "wrote", wrote)
 	s.touch(slug)
 
 	metaTick := time.NewTicker(v.MetaEvery)
@@ -179,12 +184,14 @@ func (s *Supervisor) runVenueOnce(ctx context.Context, v VenueSpec, log *slog.Lo
 			marketCount = n
 			s.touch(slug)
 		case <-quoteTick.C:
-			n, err := s.pollQuotes(ctx, v.Adapter)
+			// polled = outcomes fetched this cycle; wrote = rows actually
+			// persisted after dedup. A healthy quiet market shows polled>0,
+			// wrote==0 — that is the dedup working, not a stall.
+			polled, wrote, err := s.pollQuotes(ctx, v.Adapter)
 			if err != nil {
 				return fmt.Errorf("quote poll: %w", err)
 			}
-			quoteCount = n
-			log.Info("poll cycle", "markets", marketCount, "quotes", quoteCount)
+			log.Info("poll cycle", "markets", marketCount, "polled", polled, "wrote", wrote)
 			s.touch(slug)
 		}
 	}
@@ -198,19 +205,40 @@ func (s *Supervisor) pollMeta(ctx context.Context, a Adapter) (int, error) {
 	return s.sink.UpsertMarkets(ctx, a.Slug(), markets)
 }
 
-func (s *Supervisor) pollQuotes(ctx context.Context, a Adapter) (int, error) {
+// pollQuotes runs one quote cycle and returns (polled, wrote): outcomes
+// fetched vs rows actually persisted after dedup. It stamps the venue
+// heartbeat on every successful cycle — including the no-active-markets case —
+// so a quiet but live venue never reads as down.
+func (s *Supervisor) pollQuotes(ctx context.Context, a Adapter) (polled int, wrote int, err error) {
 	ids, err := s.sink.ActiveMarketIDs(ctx, a.Slug())
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if len(ids) == 0 {
-		return 0, nil
+		s.markPolled(ctx, a.Slug())
+		return 0, 0, nil
 	}
 	quotes, err := a.FetchQuotes(ctx, ids)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return s.sink.InsertQuotes(ctx, a.Slug(), quotes)
+	wrote, err = s.sink.InsertQuotes(ctx, a.Slug(), quotes)
+	if err != nil {
+		return len(quotes), wrote, err
+	}
+	s.markPolled(ctx, a.Slug())
+	return len(quotes), wrote, nil
+}
+
+// markPolled stamps the liveness heartbeat best-effort. WHY swallow the error:
+// the quote write already succeeded; failing the whole cycle (and triggering a
+// backoff restart) because a one-row heartbeat update hiccuped would hurt
+// ingestion, not help it. A missed heartbeat just makes /healthz briefly
+// pessimistic, which the next cycle corrects.
+func (s *Supervisor) markPolled(ctx context.Context, slug string) {
+	if err := s.sink.MarkVenuePolled(ctx, slug); err != nil {
+		s.log.Warn("venue heartbeat failed", "venue", slug, "err", err)
+	}
 }
 
 func (s *Supervisor) setRunning(slug string, running bool) {

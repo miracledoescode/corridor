@@ -112,7 +112,59 @@ func TestIdempotentIngest(t *testing.T) {
 		t.Error("quotes.raw should be NULL (raw payload no longer stored)")
 	}
 
-	// Retention: a quote older than the cutoff is pruned, a fresh one is kept.
+	// Write-time dedup: the same price at a NEW timestamp must NOT write a row;
+	// a changed price must. (q above already seeded bid 0.57 in the cache.)
+	same := q
+	same.Time = q.Time.Add(30 * time.Second)
+	if n, err := st.InsertQuotes(ctx, "polymarket", []ingest.Quote{same}); err != nil {
+		t.Fatal(err)
+	} else if n != 0 {
+		t.Errorf("unchanged price wrote %d rows, want 0 (dedup)", n)
+	}
+	moved := q
+	moved.Time = q.Time.Add(60 * time.Second)
+	moved.Bid = "0.61" // price moved
+	if n, err := st.InsertQuotes(ctx, "polymarket", []ingest.Quote{moved}); err != nil {
+		t.Fatal(err)
+	} else if n != 1 {
+		t.Errorf("changed price wrote %d rows, want 1", n)
+	}
+
+	// Warm a FRESH store from the DB: the last stored price (0.61) must land in
+	// the rebuilt cache, so re-submitting it dedups rather than writing.
+	st2, err := New(ctx, dbURL, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st2.WarmDedupCache(ctx); err != nil {
+		t.Fatal(err)
+	}
+	warm := moved
+	warm.Time = moved.Time.Add(30 * time.Second)
+	if n, err := st2.InsertQuotes(ctx, "polymarket", []ingest.Quote{warm}); err != nil {
+		t.Fatal(err)
+	} else if n != 0 {
+		t.Errorf("warmed cache wrote %d rows, want 0 (price unchanged across restart)", n)
+	}
+	st2.Close()
+
+	// Heartbeat: MarkVenuePolled stamps venues.last_polled_at fresh.
+	if err := st.MarkVenuePolled(ctx, "polymarket"); err != nil {
+		t.Fatal(err)
+	}
+	var polledLag float64
+	err = st.pool.QueryRow(ctx,
+		`SELECT EXTRACT(EPOCH FROM (now() - last_polled_at)) FROM venues WHERE slug='polymarket'`).Scan(&polledLag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if polledLag > 60 {
+		t.Errorf("last_polled_at lag = %.0fs, want fresh (<60s)", polledLag)
+	}
+
+	// Retention: a quote older than the cutoff is pruned, fresh ones kept. By
+	// now itest-yes has two fresh rows (0.57 @ t, 0.61 @ t+60s); the deduped
+	// and warm submissions wrote nothing.
 	old := ingest.Quote{
 		VenueMarketID:  "itest-market-1",
 		VenueOutcomeID: "itest-yes",
@@ -136,8 +188,8 @@ func TestIdempotentIngest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if remaining != 1 { // only the fresh quote survives
-		t.Errorf("after retention %d quotes remain, want 1 (the fresh one)", remaining)
+	if remaining != 2 { // the two fresh price points survive
+		t.Errorf("after retention %d quotes remain, want 2 (the fresh price points)", remaining)
 	}
 
 	// Cleanup so repeated test runs stay deterministic.

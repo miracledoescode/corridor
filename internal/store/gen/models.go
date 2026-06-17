@@ -54,4 +54,5 @@ type Venue struct {
 	BaseCurrency string
 	FeeModel     []byte
 	CreatedAt    pgtype.Timestamptz
+	LastPolledAt pgtype.Timestamptz
 }

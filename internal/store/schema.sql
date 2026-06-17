@@ -4,12 +4,13 @@
 -- embeddings; that is Phase 2 Python territory).
 
 CREATE TABLE venues (
-    id            SMALLSERIAL PRIMARY KEY,
-    slug          TEXT NOT NULL UNIQUE,
-    name          TEXT NOT NULL,
-    base_currency TEXT NOT NULL DEFAULT 'USD',
-    fee_model     JSONB NOT NULL DEFAULT '{}',
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    id             SMALLSERIAL PRIMARY KEY,
+    slug           TEXT NOT NULL UNIQUE,
+    name           TEXT NOT NULL,
+    base_currency  TEXT NOT NULL DEFAULT 'USD',
+    fee_model      JSONB NOT NULL DEFAULT '{}',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_polled_at TIMESTAMPTZ  -- per-venue ingest heartbeat (migration 003)
 );
 
 CREATE TABLE events (

@@ -60,6 +60,8 @@ func (m *memSink) ActiveMarketIDs(ctx context.Context, slug string) ([]string, e
 	return []string{"m1"}, nil
 }
 
+func (m *memSink) MarkVenuePolled(ctx context.Context, slug string) error { return nil }
+
 func (m *memSink) quoteCount(slug string) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
