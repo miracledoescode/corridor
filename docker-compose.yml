@@ -10,6 +10,7 @@
 services:
   redis:
     image: redis:7-alpine
+    restart: unless-stopped # come back up on its own, same as corridord
     ports:
       - "6379:6379"
     healthcheck:
