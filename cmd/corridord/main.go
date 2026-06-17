@@ -64,6 +64,15 @@ func main() {
 	}
 	sup := ingest.NewSupervisor(st, log, venues)
 
+	// Retention: prune quotes older than the cutoff so the table stays under
+	// the Supabase free-tier storage cap. WHY here and not a separate
+	// service: corridord is the modular monolith; a once-daily DELETE is a
+	// goroutine, not an ops dependency. WHY retain at all (vs keep forever):
+	// today Corridor is a comparison tool, not a tick archive. When deep
+	// odds history becomes the product (data API), revisit retention + a Pro
+	// storage tier.
+	go runRetention(ctx, st, cfg.quoteRetentionDays, log)
+
 	srv := api.NewServer(":"+cfg.port, st, sup, log)
 	go func() {
 		log.Info("api listening", "addr", srv.Addr)
@@ -79,6 +88,32 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
 	log.Info("corridord stopped")
+}
+
+// runRetention deletes quotes older than days, once on startup and then
+// every 24h, until ctx is cancelled. Failures are logged, never fatal —
+// ingestion must not stop because a prune failed (prime directive).
+func runRetention(ctx context.Context, st *store.Store, days int, log *slog.Logger) {
+	prune := func() {
+		n, err := st.DeleteQuotesOlderThan(ctx, days)
+		if err != nil {
+			log.Error("quote retention failed", "err", err, "retention_days", days)
+			return
+		}
+		log.Info("quote retention", "deleted", n, "retention_days", days)
+	}
+
+	prune() // once at startup
+	t := time.NewTicker(24 * time.Hour)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			prune()
+		}
+	}
 }
 
 func mustStore(ctx context.Context, cfg config, log *slog.Logger) *store.Store {
