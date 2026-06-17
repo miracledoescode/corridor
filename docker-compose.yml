@@ -1,25 +1,13 @@
+# Corridor stack.
+#
+# WHY no local Postgres service: prod is Supabase managed Postgres and that
+# is the single database — corridord reads DB_URL straight from .env (the
+# Supabase transaction-pooler URL). Keeping a local `db` container here was a
+# Phase-1 leftover and an active footgun: the committed override pointed
+# corridord at the throwaway container, so a fresh clone / redeploy could
+# silently write the odds-history moat to ephemeral storage. Redis stays as a
+# local sidecar — it only holds live top-of-book and is safe to lose.
 services:
-  db:
-    # WHY the -ha image: it bundles TimescaleDB AND pgvector on pg16; the
-    # plain timescaledb image lacks pgvector and would need a custom build.
-    image: timescale/timescaledb-ha:pg16
-    environment:
-      POSTGRES_DB: corridor
-      POSTGRES_USER: corridor
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-corridor}
-    ports:
-      - "5432:5432"
-    volumes:
-      # WHY this path: the -ha image keeps its data under /home/postgres,
-      # not the stock /var/lib/postgresql — mounting the wrong path means
-      # silent data loss on container recreation.
-      - pgdata:/home/postgres/pgdata/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U corridor -d corridor"]
-      interval: 5s
-      timeout: 3s
-      retries: 12
-
   redis:
     image: redis:7-alpine
     ports:
@@ -29,26 +17,22 @@ services:
       interval: 5s
       timeout: 3s
       retries: 12
-    # WHY no persistence: Redis only holds live top-of-book; Postgres is
-    # the source of truth. Losing Redis loses nothing we can't repopulate
-    # on the next quote poll.
+    # WHY no persistence: Redis only holds live top-of-book; Supabase is the
+    # source of truth. Losing Redis loses nothing we can't repopulate on the
+    # next quote poll.
 
   corridord:
     build: .
     restart: unless-stopped # prime directive: come back up, always
     depends_on:
-      db:
-        condition: service_healthy
       redis:
         condition: service_healthy
     env_file: .env
     environment:
-      # In-network hostnames; these override the host-side values in .env,
-      # which point at localhost for `make run` / `make migrate`.
-      DB_URL: postgresql://postgres.<project-ref>:REDACTED@aws-1-eu-central-1.pooler.supabase.com:6543/postgres?sslmode=require
+      # DB_URL is NOT overridden — it comes from .env (Supabase pooler), the
+      # single source of truth. Only REDIS_URL is overridden, because the
+      # cache is the sidecar container, reachable as `redis` on the compose
+      # network (the .env value is localhost, for host-side tooling).
       REDIS_URL: redis://redis:6379/0
     ports:
       - "${PORT:-8080}:8080"
-
-volumes:
-  pgdata:
