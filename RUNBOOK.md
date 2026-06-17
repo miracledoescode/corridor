@@ -28,3 +28,44 @@ Checklist, in order:
    candidate network for BOTH venues first. Ingestion uptime is the prime
    directive — venue reachability is a deployment criterion, not an
    afterthought.
+
+## Database: Supabase managed Postgres
+
+Prod DB is Supabase (project `corridor`, eu-central-1). pgvector is enabled;
+TimescaleDB is **not available** — the schema is plain Postgres on purpose so
+the same goose migrations run on Supabase and local docker. RLS is enabled on
+all public tables (migration `002`); corridord connects as the owner role and
+bypasses RLS, so ingestion is unaffected.
+
+### Connection string
+- Use the **transaction POOLER** endpoint: host `...pooler.supabase.com`,
+  **port 6543** — NOT the direct `:5432`. The direct endpoint's low
+  connection cap would be exhausted by the supervisor's per-venue pool and
+  stall ingestion.
+- `sslmode=require` (Supabase needs TLS).
+- URL-encode special characters in the password (`/`→`%2F`, `%`→`%25`,
+  `@`→`%40`, …) or, simpler, set a password that's alphanumeric only.
+  A raw `/` in the password is what caused the `invalid port` goose error.
+
+### pgx + the transaction pooler — READ BEFORE TOUCHING CONNECTION CODE
+The transaction pooler does **not** pin a logical connection to one backend
+across round trips. Any pgx mode that relies on server-side prepared
+statements (the default `CacheStatement`, and `DescribeExec`) will prepare on
+one backend and execute on another → **`unnamed prepared statement does not
+exist` (SQLSTATE 26000)**, which repeatedly crashed the Kalshi sweep on
+cutover.
+
+Fix, already in `internal/store/store.go` (both the pgxpool and the goose
+connection):
+- `DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol` — no prepared
+  statements at all, so nothing for the pooler to lose between trips.
+- Because simple protocol can't ask the server for parameter types, an
+  `AfterConnect` hook registers Go `[]byte` as `jsonb` (`RegisterDefaultPgType`).
+  Without it the `raw` JSONB columns get mis-encoded as bytea →
+  `invalid input syntax for type json (22P02)`. Safe because we have no
+  bytea columns.
+
+If a future change reintroduces `26000`, the cause is almost always a code
+path that bypassed this config (a new pool, a raw `pgxpool.New`, or a tool
+like goose opened without simple protocol). Do not "fix" it by switching to
+the session pooler or direct connection — keep simple protocol.
