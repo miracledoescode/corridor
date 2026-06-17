@@ -21,7 +21,7 @@ migrate:
 	go run github.com/pressly/goose/v3/cmd/goose@v3.27.1 -dir migrations postgres "$(DB_URL)" up
 
 verify:
-	docker compose exec -T db psql -U corridor -d corridor -c "\
+	@psql "$(DB_URL)" -c "\
 	SELECT v.slug, \
 	       COUNT(DISTINCT m.id) AS markets, \
 	       COUNT(q.time)        AS quotes, \
@@ -40,8 +40,8 @@ run:
 	go run ./cmd/corridord
 
 backup:
-	mkdir -p backups
-	docker compose exec -T db pg_dump -U corridor -Fc corridor > backups/corridor_$$(date +%Y%m%dT%H%M%S).dump
+	@mkdir -p backups
+	@pg_dump "$(DB_URL)" -Fc > backups/corridor_$$(date +%Y%m%dT%H%M%S).dump
 
 # Regenerate internal/store/gen from the .sql query files.
 # WHY pinned via go run: no global install needed; everyone gets the same

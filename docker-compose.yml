@@ -45,7 +45,7 @@ services:
     environment:
       # In-network hostnames; these override the host-side values in .env,
       # which point at localhost for `make run` / `make migrate`.
-      DB_URL: postgres://corridor:${POSTGRES_PASSWORD:-corridor}@db:5432/corridor?sslmode=disable
+      DB_URL: postgresql://postgres.orjccdkmnrrjqgqdhpau:tGhI3lIM066lwknB@aws-1-eu-central-1.pooler.supabase.com:6543/postgres?sslmode=require
       REDIS_URL: redis://redis:6379/0
     ports:
       - "${PORT:-8080}:8080"
