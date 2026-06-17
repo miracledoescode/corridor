@@ -34,6 +34,23 @@ type Store struct {
 
 	mu       sync.Mutex
 	venueIDs map[string]int16 // slug → venues.id; immutable rows, safe to cache
+
+	// priceMu guards lastPx, the write-time dedup cache: for each outcome,
+	// the price of the most recent quote we stored. The two venue loops call
+	// InsertQuotes concurrently, so this must be locked.
+	priceMu sync.Mutex
+	lastPx  map[string]pricePoint
+}
+
+// pricePoint is an outcome's last-stored price, as scale-normalized keys so
+// equal values compare equal regardless of source formatting.
+type pricePoint struct{ bid, ask, last string }
+
+// pxKey identifies an outcome the same way the InsertQuote query resolves it
+// (venue slug + venue's market id + venue's outcome id), so the dedup cache
+// and the DB write agree on identity without needing surrogate ids in memory.
+func pxKey(venueSlug, venueMarketID, venueOutcomeID string) string {
+	return venueSlug + "\x1f" + venueMarketID + "\x1f" + venueOutcomeID
 }
 
 // maxPoolConns caps concurrent connections corridord opens.
@@ -94,6 +111,7 @@ func New(ctx context.Context, dbURL string, log *slog.Logger) (*Store, error) {
 		q:        gen.New(pool),
 		log:      log,
 		venueIDs: make(map[string]int16),
+		lastPx:   make(map[string]pricePoint),
 	}, nil
 }
 
@@ -203,8 +221,28 @@ func (s *Store) upsertOne(ctx context.Context, venueID int16, m ingest.Market) e
 	return tx.Commit(ctx)
 }
 
-// InsertQuotes implements ingest.Sink. Duplicate (outcome, time) rows are
-// silently skipped by the unique index — re-runs never duplicate.
+// InsertQuotes implements ingest.Sink. It persists a quote row only when the
+// price CHANGED since the outcome's last stored quote; an unchanged price is
+// skipped. Returns the number of rows actually written.
+//
+// WHY write-time dedup (Phase 1.5): we poll top-of-book every ~10s, but
+// prediction-market prices sit still for long stretches. Writing a row every
+// cycle regardless grew quotes by ~1.8M rows/day and would cross the Supabase
+// free-tier cap in days → the project flips read-only → ingestion writes fail
+// (the prime-directive nightmare). Storing only changes cuts volume 5-20×.
+//
+// SEMANTICS: quotes now means "price CHANGES", not "samples at fixed
+// intervals". The price at any time T is the most recent quote row at or
+// before T (carry the last value forward) — NOT a row stamped exactly at T.
+// Everything downstream (matcher, spread engine, charts) must reconstruct a
+// point-in-time price as "latest quote <= T". Liveness ("is ingestion
+// alive?") moved to the venues.last_polled_at heartbeat, because MAX(q.time)
+// no longer advances when prices are stable.
+//
+// WHY only bid/ask/last gate the write (not volume_24h / liquidity): those
+// drift almost every cycle and would defeat dedup entirely. We do not write a
+// row just because volume moved; the latest volume/liquidity rides along
+// opportunistically on whatever row a price change produces.
 func (s *Store) InsertQuotes(ctx context.Context, venueSlug string, quotes []ingest.Quote) (int, error) {
 	inserted := 0
 	for _, qt := range quotes {
@@ -214,21 +252,81 @@ func (s *Store) InsertQuotes(ctx context.Context, venueSlug string, quotes []ing
 				"venue", venueSlug, "outcome", qt.VenueOutcomeID, "err", err)
 			continue
 		}
-		n, err := s.q.InsertQuote(ctx, params)
-		if err != nil {
-			return inserted, fmt.Errorf("insert quote: %w", err)
-		}
-		inserted += int(n)
 
+		// Always refresh the live top-of-book cache, even on an unchanged
+		// price: Redis entries carry a TTL, so skipping the refresh during a
+		// stable stretch would let the "current price" expire out of the
+		// cache. Dedup applies only to the durable quotes table, never to the
+		// live cache. Best-effort; TopBook logs its own failures.
 		if s.TopBook != nil {
-			// Best-effort mirror; TopBook logs its own failures and never
-			// returns an error into the ingest path.
 			s.TopBook.Set(ctx, venueSlug, qt.VenueMarketID, qt.VenueOutcomeID, cache.Entry{
 				Bid: qt.Bid, Ask: qt.Ask, Last: qt.Last, Time: qt.Time,
 			})
 		}
+
+		key := pxKey(venueSlug, qt.VenueMarketID, qt.VenueOutcomeID)
+		cur := pricePoint{
+			bid:  canonicalKey(params.Bid),
+			ask:  canonicalKey(params.Ask),
+			last: canonicalKey(params.Last),
+		}
+		s.priceMu.Lock()
+		prev, seen := s.lastPx[key]
+		s.priceMu.Unlock()
+		if seen && prev == cur {
+			continue // price unchanged → no new row
+		}
+
+		n, err := s.q.InsertQuote(ctx, params)
+		if err != nil {
+			return inserted, fmt.Errorf("insert quote: %w", err)
+		}
+		// Record what we just stored as this outcome's latest price. We update
+		// the cache on a write attempt (not only when n==1): n==0 means the
+		// (outcome, time) row already existed — the stored value still equals
+		// cur, so the cache stays correct.
+		s.priceMu.Lock()
+		s.lastPx[key] = cur
+		s.priceMu.Unlock()
+		inserted += int(n)
 	}
 	return inserted, nil
+}
+
+// WarmDedupCache seeds the in-memory dedup cache from the newest stored quote
+// per outcome. WHY: without it, a restart starts with an empty cache and the
+// first poll re-writes a row for every outcome (a few thousand redundant rows
+// per restart) before dedup kicks in. Best-effort by design — a failure just
+// means that one-time redundant write, never a fatal boot error.
+func (s *Store) WarmDedupCache(ctx context.Context) error {
+	rows, err := s.q.LatestQuotePerOutcome(ctx)
+	if err != nil {
+		return err
+	}
+	s.priceMu.Lock()
+	defer s.priceMu.Unlock()
+	for _, r := range rows {
+		// COALESCE in the query maps a NULL price to "", which
+		// NumericFromString turns back into a NULL Numeric — same as the live
+		// path, so the keys match. Parse errors can't happen on text we wrote.
+		bid, _ := NumericFromString(r.Bid)
+		ask, _ := NumericFromString(r.Ask)
+		last, _ := NumericFromString(r.Last)
+		s.lastPx[pxKey(r.VenueSlug, r.VenueMarketID, r.VenueOutcomeID)] = pricePoint{
+			bid:  canonicalKey(bid),
+			ask:  canonicalKey(ask),
+			last: canonicalKey(last),
+		}
+	}
+	s.log.Info("dedup cache warmed", "outcomes", len(rows))
+	return nil
+}
+
+// MarkVenuePolled implements ingest.Sink: stamp the venue heartbeat at the end
+// of every quote cycle so /healthz and `make verify` can tell a stable-price
+// venue (healthy, no new quotes) from a dead one. See migration 003.
+func (s *Store) MarkVenuePolled(ctx context.Context, venueSlug string) error {
+	return s.q.MarkVenuePolled(ctx, venueSlug)
 }
 
 func quoteParams(venueSlug string, qt ingest.Quote) (gen.InsertQuoteParams, error) {
@@ -285,10 +383,13 @@ func (s *Store) DeleteQuotesOlderThan(ctx context.Context, days int) (int64, err
 	return tag.RowsAffected(), nil
 }
 
-// VenueLag reports the newest quote per venue for /healthz.
+// VenueLag reports a venue's liveness for /healthz. LastPolledAt is the
+// heartbeat (advances every cycle = the health signal); LastQuoteAt is the
+// last actual price change (may be old when prices are stable = informational).
 type VenueLag struct {
-	Slug        string
-	LastQuoteAt *time.Time
+	Slug         string
+	LastPolledAt *time.Time
+	LastQuoteAt  *time.Time
 }
 
 func (s *Store) VenueLags(ctx context.Context) ([]VenueLag, error) {
@@ -299,6 +400,10 @@ func (s *Store) VenueLags(ctx context.Context) ([]VenueLag, error) {
 	out := make([]VenueLag, 0, len(rows))
 	for _, r := range rows {
 		vl := VenueLag{Slug: r.Slug}
+		if r.LastPolledAt.Valid {
+			t := r.LastPolledAt.Time
+			vl.LastPolledAt = &t
+		}
 		if r.LastQuoteAt.Valid {
 			t := r.LastQuoteAt.Time
 			vl.LastQuoteAt = &t

@@ -11,15 +11,16 @@ import (
 	"github.com/miracledoescode/corridor/internal/store"
 )
 
-// healthyLag is how stale a venue's newest quote may be before /healthz
-// reports it degraded. Matches the acceptance criterion (lag < 120s).
+// healthyLag is how stale a venue's heartbeat may be before /healthz reports
+// it degraded. Matches the acceptance criterion (lag < 120s).
 const healthyLag = 120 * time.Second
 
 type VenueHealth struct {
-	Slug        string     `json:"slug"`
-	LagSeconds  *int64     `json:"lag_seconds"`   // null until the first quote lands
-	LastQuoteAt *time.Time `json:"last_quote_at"` // null until the first quote lands
-	Healthy     bool       `json:"healthy"`
+	Slug         string     `json:"slug"`
+	LagSeconds   *int64     `json:"lag_seconds"`    // since last poll; null until first poll
+	LastPolledAt *time.Time `json:"last_polled_at"` // liveness heartbeat; null until first poll
+	LastQuoteAt  *time.Time `json:"last_quote_at"`  // last PRICE CHANGE; old if prices are stable
+	Healthy      bool       `json:"healthy"`
 }
 
 type HealthResponse struct {
@@ -38,8 +39,11 @@ type LagSource interface {
 	VenueLags(ctx context.Context) ([]store.VenueLag, error)
 }
 
-// healthz combines both views: the DB says when the last quote landed
-// (survives restarts), the supervisor says whether the loop is alive now.
+// healthz combines both views: the DB heartbeat (last_polled_at) says when the
+// venue loop last completed a cycle (survives restarts), the supervisor says
+// whether the loop is alive right now. WHY the heartbeat and not MAX(quote
+// time): quotes are deduped to price changes, so a healthy venue with stable
+// prices writes no quotes for minutes — the heartbeat advances regardless.
 func healthz(lags LagSource, sup StatusSource, log *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		vlags, err := lags.VenueLags(r.Context())
@@ -53,14 +57,14 @@ func healthz(lags LagSource, sup StatusSource, log *slog.Logger) http.HandlerFun
 		resp := HealthResponse{Status: "ok"}
 		now := time.Now()
 		for _, vl := range vlags {
-			vh := VenueHealth{Slug: vl.Slug, LastQuoteAt: vl.LastQuoteAt}
-			if vl.LastQuoteAt != nil {
-				lag := int64(now.Sub(*vl.LastQuoteAt).Seconds())
+			vh := VenueHealth{Slug: vl.Slug, LastPolledAt: vl.LastPolledAt, LastQuoteAt: vl.LastQuoteAt}
+			if vl.LastPolledAt != nil {
+				lag := int64(now.Sub(*vl.LastPolledAt).Seconds())
 				vh.LagSeconds = &lag
-				vh.Healthy = now.Sub(*vl.LastQuoteAt) < healthyLag
+				vh.Healthy = now.Sub(*vl.LastPolledAt) < healthyLag
 			}
-			// A venue with no running loop is unhealthy even if a quote
-			// landed seconds ago — it is about to go stale.
+			// A venue with no running loop is unhealthy even if it polled
+			// seconds ago — it is about to go stale.
 			if st, ok := loopStatus[vl.Slug]; ok && !st.Running {
 				vh.Healthy = false
 			}

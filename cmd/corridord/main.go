@@ -49,6 +49,13 @@ func main() {
 		}
 	}
 
+	// Seed the write-time dedup cache from the DB before polling starts, so a
+	// restart doesn't re-write a row for every outcome on the first cycle.
+	// Best-effort: a failure only costs that one redundant cycle.
+	if err := st.WarmDedupCache(ctx); err != nil {
+		log.Warn("dedup cache warm failed; first cycle may write redundant rows", "err", err)
+	}
+
 	ua := ingest.UserAgent(cfg.userAgentContact)
 	venues := []ingest.VenueSpec{
 		{

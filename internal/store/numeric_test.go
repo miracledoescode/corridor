@@ -51,3 +51,50 @@ func TestNumericFromString(t *testing.T) {
 		})
 	}
 }
+
+// TestCanonicalKey is the dedup correctness guard: values that are equal must
+// key equal regardless of trailing-zero scale (the cache is seeded from
+// scale-padded DB text but compared against raw venue text), and distinct
+// values — including NULL vs zero — must key apart.
+func TestCanonicalKey(t *testing.T) {
+	key := func(s string) string {
+		n, err := NumericFromString(s)
+		if err != nil {
+			t.Fatalf("NumericFromString(%q): %v", s, err)
+		}
+		return canonicalKey(n)
+	}
+
+	// Scale must not matter: these are all the same price.
+	for _, eq := range [][]string{
+		{"0.57", "0.57000", "0.570"},
+		{"100", "100.00", "100.000"},
+		{"0", "0.0", "0.00", "0.000"},
+	} {
+		want := key(eq[0])
+		for _, s := range eq[1:] {
+			if got := key(s); got != want {
+				t.Errorf("canonicalKey(%q)=%q, want %q (== canonicalKey(%q))", s, got, want, eq[0])
+			}
+		}
+	}
+
+	// Distinct values, and NULL, must all key apart.
+	distinct := map[string]string{
+		"NULL": key(""), // empty string → NULL Numeric
+		"zero": key("0"),
+		"0.57": key("0.57"),
+		"0.61": key("0.61"),
+		"0.07": key("0.07143"),
+	}
+	seen := map[string]string{}
+	for label, k := range distinct {
+		if prev, dup := seen[k]; dup {
+			t.Errorf("canonicalKey collision: %s and %s both keyed %q", prev, label, k)
+		}
+		seen[k] = label
+	}
+	if distinct["NULL"] != "" {
+		t.Errorf("NULL must key to empty string, got %q", distinct["NULL"])
+	}
+}

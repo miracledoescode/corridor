@@ -45,6 +45,32 @@ corridord reads `DB_URL` from `.env`; `make verify` / `make backup` /
 different DB than the one corridord writes. Local/offline dev = bring your
 own Postgres and point `DB_URL` at it.
 
+### Quotes are price CHANGES, not fixed-interval samples (Phase 1.5)
+The quote write path dedups: a row is stored only when an outcome's
+**bid/ask/last** differ from its last stored quote (volume/liquidity do NOT
+trigger a write — they drift every cycle and would defeat dedup; the latest
+values ride along on whatever row a price change produces). This cut row
+growth ~5-20× to keep `quotes` under the Supabase free-tier cap; writing
+every ~10s sample would otherwise cross 500MB in days and flip the project
+read-only (ingestion writes fail — prime-directive nightmare).
+
+Consequences anyone touching this must know:
+- **Point-in-time price = the most recent quote row at or before T**, carried
+  forward. There is NO row stamped exactly at each interval. The matcher,
+  spread engine and charts must reconstruct "price at T" as `latest quote
+  <= T`, never "row where time = T".
+- **Liveness is `venues.last_polled_at`, NOT `MAX(quotes.time)`.** The quote
+  loop stamps the heartbeat every cycle even when nothing changed, so a quiet
+  market stays healthy. `/healthz` `lag_seconds` and `make verify`
+  `lag_seconds` both measure now() − last_polled_at; `last_price_change` /
+  `last_quote_at` are shown separately and may legitimately be minutes old.
+  If you ever see lag climb on `MAX(quotes.time)` and panic — don't; check
+  `last_polled_at` instead.
+- An in-memory cache holds each outcome's last price; it's warmed from the DB
+  on startup (`WarmDedupCache`) so a restart doesn't re-write every outcome.
+  Worst case if warm-up fails: one redundant cycle of writes, then dedup
+  resumes. Never fatal.
+
 ### Connection string
 - Use the **transaction POOLER** endpoint: host `...pooler.supabase.com`,
   **port 6543** — NOT the direct `:5432`. The direct endpoint's low
