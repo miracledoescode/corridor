@@ -18,6 +18,8 @@ type config struct {
 	kalshiMetaEvery     time.Duration
 	quoteEvery          time.Duration
 
+	quoteRetentionDays int
+
 	polymarketGammaURL string
 	polymarketClobURL  string
 	kalshiBaseURL      string
@@ -36,6 +38,7 @@ func loadConfig() (config, error) {
 		polymarketMetaEvery: envSeconds("POLYMARKET_POLL_INTERVAL_S", 60),
 		kalshiMetaEvery:     envSeconds("KALSHI_POLL_INTERVAL_S", 60),
 		quoteEvery:          envSeconds("QUOTE_POLL_INTERVAL_S", 10),
+		quoteRetentionDays:  envInt("QUOTE_RETENTION_DAYS", 7),
 		polymarketGammaURL:  envDefault("POLYMARKET_GAMMA_URL", "https://gamma-api.polymarket.com"),
 		polymarketClobURL:   envDefault("POLYMARKET_CLOB_URL", "https://clob.polymarket.com"),
 		// WHY external-api and not api.elections: Kalshi's docs put
@@ -68,6 +71,18 @@ func envDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
 }
 
 func envSeconds(key string, def int) time.Duration {
