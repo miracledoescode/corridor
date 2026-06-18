@@ -85,13 +85,29 @@ func NewSupervisor(sink Sink, log *slog.Logger, venues []VenueSpec) *Supervisor 
 }
 
 // Run blocks until ctx is cancelled, supervising every venue loop.
+//
+// WHY two goroutines per venue (meta + quotes) rather than one: the metadata
+// refresh writes hundreds of rows to a remote DB and can take tens of seconds;
+// running it in the same loop as the 10s quote sweep froze quote ingestion for
+// that whole stretch. Splitting them means a slow metadata write never blocks
+// price capture (or the liveness heartbeat). Venue isolation is preserved —
+// each loop is independently crash-contained and backoff-restarted, and one
+// venue's loops can never affect another's. The adapter is safe for concurrent
+// FetchMarkets/FetchQuotes, and both loops share the venue's 1 req/s limiter,
+// so politeness is unchanged.
 func (s *Supervisor) Run(ctx context.Context) {
 	var wg sync.WaitGroup
 	for _, v := range s.venues {
-		wg.Add(1)
+		wg.Add(2)
+		// quotes is the "primary" loop: it owns the venue's Running status
+		// (health cares about price capture, not metadata freshness).
 		go func(v VenueSpec) {
 			defer wg.Done()
-			s.superviseVenue(ctx, v)
+			s.superviseTask(ctx, v, "quote", true, s.runQuotes)
+		}(v)
+		go func(v VenueSpec) {
+			defer wg.Done()
+			s.superviseTask(ctx, v, "meta", false, s.runMeta)
 		}(v)
 	}
 	wg.Wait()
@@ -108,30 +124,39 @@ func (s *Supervisor) Status() map[string]VenueStatus {
 	return out
 }
 
-func (s *Supervisor) superviseVenue(ctx context.Context, v VenueSpec) {
+// superviseTask runs one loop (meta or quotes) for a venue with panic
+// recovery and exponential-backoff restarts. The primary loop owns the
+// venue's Running status. Any error escapes here and is restarted with
+// backoff — one mechanism for both "HTTP errors back off" and crash recovery.
+func (s *Supervisor) superviseTask(ctx context.Context, v VenueSpec, name string, primary bool,
+	run func(context.Context, VenueSpec, *slog.Logger) error) {
 	slug := v.Adapter.Slug()
-	log := s.log.With("venue", slug)
+	log := s.log.With("venue", slug, "loop", name)
 	attempt := 0
 
 	for ctx.Err() == nil {
-		s.setRunning(slug, true)
+		if primary {
+			s.setRunning(slug, true)
+		}
 		started := time.Now()
-		err := s.runVenueOnce(ctx, v, log)
-		s.setRunning(slug, false)
+		err := run(ctx, v, log)
+		if primary {
+			s.setRunning(slug, false)
+		}
 		if ctx.Err() != nil {
 			return
 		}
 
-		// WHY reset after a healthy stretch: a venue that ran fine for an
+		// WHY reset after a healthy stretch: a loop that ran fine for an
 		// hour and then hiccuped should retry in 1s, not wherever the
-		// counter was left weeks ago.
+		// counter was left.
 		if time.Since(started) > s.healthyAfter {
 			attempt = 0
 		}
 		wait := Backoff(attempt, s.backoffBase, s.backoffMax)
 		attempt++
 		s.recordErr(slug, err)
-		log.Error("venue loop crashed; restarting",
+		log.Error("loop crashed; restarting",
 			"err", err, "restart_in", wait.String(), "attempt", attempt)
 
 		select {
@@ -142,11 +167,47 @@ func (s *Supervisor) superviseVenue(ctx context.Context, v VenueSpec) {
 	}
 }
 
-// runVenueOnce runs one venue's polling loop until it errors, panics, or
-// the context is cancelled. Any error escapes to the supervisor, which
-// restarts the loop with backoff — that single mechanism covers both
-// "HTTP errors back off (max 5 min)" and crash recovery.
-func (s *Supervisor) runVenueOnce(ctx context.Context, v VenueSpec, log *slog.Logger) (err error) {
+// runMeta refreshes market metadata on MetaEvery until it errors, panics, or
+// ctx is cancelled. It runs independently of the quote loop so a slow
+// metadata write never blocks price capture.
+func (s *Supervisor) runMeta(ctx context.Context, v VenueSpec, log *slog.Logger) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v\n%s", r, debug.Stack())
+		}
+	}()
+
+	refresh := func() error {
+		n, err := s.pollMeta(ctx, v.Adapter)
+		if err != nil {
+			return fmt.Errorf("metadata poll: %w", err)
+		}
+		log.Info("metadata refreshed", "markets", n)
+		return nil
+	}
+	if err := refresh(); err != nil {
+		return err
+	}
+
+	t := time.NewTicker(v.MetaEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+			if err := refresh(); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// runQuotes sweeps top-of-book on QuoteEvery until it errors, panics, or ctx
+// is cancelled. polled = outcomes fetched; wrote = rows persisted after
+// dedup. A healthy quiet market shows polled>0, wrote==0 — dedup working, not
+// a stall. The heartbeat (inside pollQuotes) advances every cycle regardless.
+func (s *Supervisor) runQuotes(ctx context.Context, v VenueSpec, log *slog.Logger) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic: %v\n%s", r, debug.Stack())
@@ -154,45 +215,29 @@ func (s *Supervisor) runVenueOnce(ctx context.Context, v VenueSpec, log *slog.Lo
 	}()
 
 	slug := v.Adapter.Slug()
-
-	// Metadata first: quotes are meaningless until markets exist.
-	marketCount, err := s.pollMeta(ctx, v.Adapter)
-	if err != nil {
-		return fmt.Errorf("metadata poll: %w", err)
+	sweep := func() error {
+		polled, wrote, err := s.pollQuotes(ctx, v.Adapter)
+		if err != nil {
+			return fmt.Errorf("quote poll: %w", err)
+		}
+		log.Info("poll cycle", "polled", polled, "wrote", wrote)
+		s.touch(slug)
+		return nil
 	}
-	polled, wrote, err := s.pollQuotes(ctx, v.Adapter)
-	if err != nil {
-		return fmt.Errorf("quote poll: %w", err)
+	if err := sweep(); err != nil {
+		return err
 	}
-	log.Info("poll cycle", "markets", marketCount, "polled", polled, "wrote", wrote)
-	s.touch(slug)
 
-	metaTick := time.NewTicker(v.MetaEvery)
-	defer metaTick.Stop()
-	quoteTick := time.NewTicker(v.QuoteEvery)
-	defer quoteTick.Stop()
-
+	t := time.NewTicker(v.QuoteEvery)
+	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-metaTick.C:
-			n, err := s.pollMeta(ctx, v.Adapter)
-			if err != nil {
-				return fmt.Errorf("metadata poll: %w", err)
+		case <-t.C:
+			if err := sweep(); err != nil {
+				return err
 			}
-			marketCount = n
-			s.touch(slug)
-		case <-quoteTick.C:
-			// polled = outcomes fetched this cycle; wrote = rows actually
-			// persisted after dedup. A healthy quiet market shows polled>0,
-			// wrote==0 — that is the dedup working, not a stall.
-			polled, wrote, err := s.pollQuotes(ctx, v.Adapter)
-			if err != nil {
-				return fmt.Errorf("quote poll: %w", err)
-			}
-			log.Info("poll cycle", "markets", marketCount, "polled", polled, "wrote", wrote)
-			s.touch(slug)
 		}
 	}
 }
