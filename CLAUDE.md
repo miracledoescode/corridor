@@ -21,8 +21,10 @@ data stored.
   see RUNBOOK.md before touching connection code.
 - Raw venue payloads ALWAYS stored in JSONB next to normalized rows.
 - One adapter per venue: FetchMarkets / FetchQuotes / Health.
-- Venue isolation: supervised goroutine per venue, backoff restarts — one
-  venue failing must never affect another.
+- Venue isolation: per venue, two supervised loops — metadata and quotes —
+  each backoff-restarted, so one venue (or one loop) failing or running slow
+  must never affect another. Metadata and quotes are split because a slow
+  metadata write must not freeze price capture.
 
 ## Hard rules
 - Idempotent upserts; re-runs never duplicate.

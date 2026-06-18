@@ -158,67 +158,102 @@ func (s *Store) venueID(ctx context.Context, slug string) (int16, error) {
 	return id, nil
 }
 
-// UpsertMarkets implements ingest.Sink. Each market and its outcomes are
-// written in one transaction so a half-written market (market row without
-// outcomes) can never be observed.
+// UpsertMarkets implements ingest.Sink. All markets and their outcomes are
+// written in two pipelined batches (markets, then outcomes) inside ONE
+// transaction, so the whole metadata sweep is ~2 network round trips instead
+// of ~4 per market.
+//
+// WHY this shape: corridord runs against a REMOTE Supabase. The old
+// per-market transaction (Begin → upsert market → upsert each outcome →
+// Commit) was ~4 round trips × hundreds of markets ≈ tens of seconds of pure
+// network latency every metadata cycle — and because that ran in the venue's
+// goroutine it FROZE quote ingestion for that whole stretch (polymarket lost
+// ~40-50s of price history per minute). Batching collapses it to ~2 round
+// trips. The transaction keeps it atomic (no market visible without its
+// outcomes), and the outcome batch resolves market_id inline so it needs no
+// id handed back from the market batch. Pooler-safe: the transaction pins one
+// backend, and the pool's simple-protocol mode sends each batch as one query.
+//
+// Trade-off vs the old loop: a DB error fails the whole cycle instead of
+// skipping one market. Acceptable — adapters pre-filter malformed markets
+// before they reach here, and a failed metadata cycle just retries (quotes,
+// in their own loop, are unaffected).
 func (s *Store) UpsertMarkets(ctx context.Context, venueSlug string, markets []ingest.Market) (int, error) {
+	if len(markets) == 0 {
+		return 0, nil
+	}
 	venueID, err := s.venueID(ctx, venueSlug)
 	if err != nil {
 		return 0, err
 	}
 
-	written := 0
-	for _, m := range markets {
-		if err := s.upsertOne(ctx, venueID, m); err != nil {
-			// WHY continue instead of abort: one malformed market must not
-			// block the other 999 from landing — partial ingest beats no
-			// ingest (prime directive).
-			s.log.Warn("market upsert failed",
-				"venue", venueSlug, "venue_market_id", m.VenueMarketID, "err", err)
-			continue
-		}
-		written++
-	}
-	if written == 0 && len(markets) > 0 {
-		return 0, fmt.Errorf("all %d market upserts failed for %s", len(markets), venueSlug)
-	}
-	return written, nil
-}
-
-func (s *Store) upsertOne(ctx context.Context, venueID int16, m ingest.Market) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback(ctx)
+	qtx := s.q.WithTx(tx)
 
-	q := s.q.WithTx(tx)
-	closeTime := pgtype.Timestamptz{}
-	if m.CloseTime != nil {
-		closeTime = pgtype.Timestamptz{Time: *m.CloseTime, Valid: true}
-	}
-	marketID, err := q.UpsertMarket(ctx, gen.UpsertMarketParams{
-		VenueID:            venueID,
-		VenueMarketID:      m.VenueMarketID,
-		Title:              m.Title,
-		ResolutionCriteria: pgtype.Text{String: m.ResolutionCriteria, Valid: m.ResolutionCriteria != ""},
-		CloseTime:          closeTime,
-		Status:             m.Status,
-		Raw:                m.Raw,
-	})
-	if err != nil {
-		return fmt.Errorf("upsert market: %w", err)
-	}
-	for _, o := range m.Outcomes {
-		if _, err := q.UpsertOutcome(ctx, gen.UpsertOutcomeParams{
-			MarketID:       marketID,
-			VenueOutcomeID: o.VenueOutcomeID,
-			Label:          o.Label,
-		}); err != nil {
-			return fmt.Errorf("upsert outcome %s: %w", o.VenueOutcomeID, err)
+	marketParams := make([]gen.UpsertMarketBatchParams, len(markets))
+	var outcomeParams []gen.UpsertOutcomeBatchParams
+	for i, m := range markets {
+		closeTime := pgtype.Timestamptz{}
+		if m.CloseTime != nil {
+			closeTime = pgtype.Timestamptz{Time: *m.CloseTime, Valid: true}
+		}
+		marketParams[i] = gen.UpsertMarketBatchParams{
+			VenueID:            venueID,
+			VenueMarketID:      m.VenueMarketID,
+			Title:              m.Title,
+			ResolutionCriteria: pgtype.Text{String: m.ResolutionCriteria, Valid: m.ResolutionCriteria != ""},
+			CloseTime:          closeTime,
+			Status:             m.Status,
+			Raw:                m.Raw,
+		}
+		for _, o := range m.Outcomes {
+			outcomeParams = append(outcomeParams, gen.UpsertOutcomeBatchParams{
+				VenueID:        venueID,
+				VenueMarketID:  m.VenueMarketID,
+				VenueOutcomeID: o.VenueOutcomeID,
+				Label:          o.Label,
+			})
 		}
 	}
-	return tx.Commit(ctx)
+
+	if err := execBatch(qtx.UpsertMarketBatch(ctx, marketParams)); err != nil {
+		return 0, fmt.Errorf("upsert markets batch: %w", err)
+	}
+	if len(outcomeParams) > 0 {
+		if err := execBatch(qtx.UpsertOutcomeBatch(ctx, outcomeParams)); err != nil {
+			return 0, fmt.Errorf("upsert outcomes batch: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit markets: %w", err)
+	}
+	return len(markets), nil
+}
+
+// batchExecResult is the common shape sqlc generates for a :batchexec result
+// (UpsertMarketBatch / UpsertOutcomeBatch). execBatch drains one, returning
+// the first per-statement error (or a Close error) so the caller can fail the
+// transaction.
+type batchExecResult interface {
+	Exec(func(int, error))
+	Close() error
+}
+
+func execBatch(r batchExecResult) error {
+	var firstErr error
+	r.Exec(func(_ int, err error) {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	})
+	if closeErr := r.Close(); closeErr != nil && firstErr == nil {
+		firstErr = closeErr
+	}
+	return firstErr
 }
 
 // InsertQuotes implements ingest.Sink. It persists a quote row only when the
