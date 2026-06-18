@@ -13,13 +13,21 @@ import (
 type fakeAdapter struct {
 	slug       string
 	fetchCalls atomic.Int64
-	panicUntil int64 // FetchMarkets panics while fetchCalls <= panicUntil
+	panicUntil int64         // FetchMarkets panics while fetchCalls <= panicUntil
+	metaDelay  time.Duration // FetchMarkets blocks this long (simulates a slow metadata write)
 }
 
 func (f *fakeAdapter) FetchMarkets(ctx context.Context) ([]Market, error) {
 	n := f.fetchCalls.Add(1)
 	if n <= f.panicUntil {
 		panic("scripted venue panic")
+	}
+	if f.metaDelay > 0 {
+		select {
+		case <-time.After(f.metaDelay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	return []Market{{VenueMarketID: "m1", Title: "t", Status: "active", Raw: []byte(`{}`)}}, nil
 }
@@ -99,5 +107,31 @@ func TestVenueIsolation(t *testing.T) {
 	st := s.Status()
 	if st["badvenue"].Restarts < 3 {
 		t.Errorf("expected >=3 recorded restarts for badvenue, got %d", st["badvenue"].Restarts)
+	}
+}
+
+// TestMetaDoesNotBlockQuotes is the regression guard for the metadata-freeze
+// bug: a slow metadata poll must not stall quote ingestion. FetchMarkets
+// blocks for the entire test window; with the old single-goroutine loop that
+// froze quotes (they ran in the same loop), so quoteCount would be ~0. With
+// metadata and quotes on separate loops, quotes keep flowing.
+func TestMetaDoesNotBlockQuotes(t *testing.T) {
+	sink := newMemSink()
+	slow := &fakeAdapter{slug: "slowmeta", metaDelay: time.Second}
+
+	s := NewSupervisor(sink, slog.Default(), []VenueSpec{
+		{Adapter: slow, MetaEvery: 10 * time.Millisecond, QuoteEvery: 5 * time.Millisecond},
+	})
+	s.backoffBase = time.Millisecond
+	s.backoffMax = 5 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	s.Run(ctx)
+
+	// ~40 quote ticks fit in 200ms while the metadata poll is blocked the
+	// whole time. Require a healthy fraction of them to have landed.
+	if got := sink.quoteCount("slowmeta"); got < 5 {
+		t.Fatalf("quotes stalled behind a blocked metadata poll: only %d quotes in 200ms", got)
 	}
 }

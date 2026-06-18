@@ -71,6 +71,23 @@ Consequences anyone touching this must know:
   Worst case if warm-up fails: one redundant cycle of writes, then dedup
   resumes. Never fatal.
 
+### Metadata and quotes run on SEPARATE loops per venue
+Each venue has two supervised goroutines: a metadata loop (refresh markets,
+`MetaEvery` ~60s) and a quote loop (top-of-book sweep, `QuoteEvery` ~10s).
+WHY split: the metadata write upserts hundreds of markets to a REMOTE
+Supabase. When it was per-market (a transaction each) it cost ~4 round trips ×
+hundreds of markets ≈ tens of seconds, and because it shared the quote loop it
+FROZE price capture for that whole stretch (polymarket was losing ~40-50s of
+history per minute). Two fixes, both live:
+- `UpsertMarkets` writes all markets then all outcomes as two pipelined
+  batches in one transaction (~2 round trips, not ~1,600). Outcomes resolve
+  `market_id` inline so they need nothing handed back from the market batch.
+- Metadata polling moved to its own goroutine, so even a slow metadata write
+  can't block quotes or the heartbeat.
+If quote lag (`last_polled_at`) ever starts sawtoothing in lockstep with the
+60s metadata tick again, suspect a regression that re-coupled the two loops or
+un-batched the upsert.
+
 ### Connection string
 - Use the **transaction POOLER** endpoint: host `...pooler.supabase.com`,
   **port 6543** — NOT the direct `:5432`. The direct endpoint's low

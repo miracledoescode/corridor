@@ -7,8 +7,6 @@ package gen
 
 import (
 	"context"
-
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const activeMarketIDs = `-- name: ActiveMarketIDs :many
@@ -48,65 +46,6 @@ SELECT id FROM venues WHERE slug = $1
 func (q *Queries) GetVenueIDBySlug(ctx context.Context, slug string) (int16, error) {
 	row := q.db.QueryRow(ctx, getVenueIDBySlug, slug)
 	var id int16
-	err := row.Scan(&id)
-	return id, err
-}
-
-const upsertMarket = `-- name: UpsertMarket :one
-INSERT INTO markets (venue_id, venue_market_id, title, resolution_criteria, close_time, status, raw)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
-ON CONFLICT (venue_id, venue_market_id) DO UPDATE SET
-    title               = EXCLUDED.title,
-    resolution_criteria = EXCLUDED.resolution_criteria,
-    close_time          = EXCLUDED.close_time,
-    status              = EXCLUDED.status,
-    raw                 = EXCLUDED.raw,
-    last_seen           = now()
-RETURNING id
-`
-
-type UpsertMarketParams struct {
-	VenueID            int16
-	VenueMarketID      string
-	Title              string
-	ResolutionCriteria pgtype.Text
-	CloseTime          pgtype.Timestamptz
-	Status             string
-	Raw                []byte
-}
-
-func (q *Queries) UpsertMarket(ctx context.Context, arg UpsertMarketParams) (int64, error) {
-	row := q.db.QueryRow(ctx, upsertMarket,
-		arg.VenueID,
-		arg.VenueMarketID,
-		arg.Title,
-		arg.ResolutionCriteria,
-		arg.CloseTime,
-		arg.Status,
-		arg.Raw,
-	)
-	var id int64
-	err := row.Scan(&id)
-	return id, err
-}
-
-const upsertOutcome = `-- name: UpsertOutcome :one
-INSERT INTO outcomes (market_id, venue_outcome_id, label)
-VALUES ($1, $2, $3)
-ON CONFLICT (market_id, venue_outcome_id) DO UPDATE SET
-    label = EXCLUDED.label
-RETURNING id
-`
-
-type UpsertOutcomeParams struct {
-	MarketID       int64
-	VenueOutcomeID string
-	Label          string
-}
-
-func (q *Queries) UpsertOutcome(ctx context.Context, arg UpsertOutcomeParams) (int64, error) {
-	row := q.db.QueryRow(ctx, upsertOutcome, arg.MarketID, arg.VenueOutcomeID, arg.Label)
-	var id int64
 	err := row.Scan(&id)
 	return id, err
 }
