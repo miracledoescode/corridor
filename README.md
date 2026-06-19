@@ -163,5 +163,5 @@ See [Notion workspace](https://app.notion.com/p/Corridor-Google-Flights-for-Pred
 
 ## License
 
-Proprietary. All rights reserved.
-© 2026 Miracle Mathew, Corridor Labs
+All rights reserved.
+© 2026 Corridor Labs

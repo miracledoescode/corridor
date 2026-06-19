@@ -1,10 +1,9 @@
 # Corridor — CLAUDE.md
 
 ## What this is
-Corridor is "Google Flights for prediction markets": a price-comparison and
+Corridor is "Google Flights for prediction markets": an AI-native price-comparison and
 arbitrage-alert layer across prediction market venues (Polymarket, Kalshi,
 Bayse; more later). Pure data layer — no custody, no bets, no execution.
-The founder is customer zero (a day trader).
 
 ## Prime directive
 INGESTION NEVER GOES DOWN. The odds-history database is the moat and cannot
