@@ -8,3 +8,4 @@
 # which silently kept the entire main package out of git — the fix(kalshi)
 # config change never shipped because of it. Anchored = binary only.
 /corridord
+.vscode
