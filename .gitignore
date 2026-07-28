@@ -9,3 +9,6 @@
 # config change never shipped because of it. Anchored = binary only.
 /corridord
 .vscode
+__pycache__/
+*.pyc
+.venv/
