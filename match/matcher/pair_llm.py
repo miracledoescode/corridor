@@ -8,13 +8,16 @@ Idempotent: pairs already in market_matches are skipped.
 Cost control: each (market_a, market_b) pair is asked at most once.
 """
 import os
+import time
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
 from .db import get_conn
 
-THRESHOLD = 0.80
-GEMINI_MODEL = "gemini-2.0-flash"
+THRESHOLD = 0.85
+GEMINI_MODEL = "gemini-2.0-flash-lite"
+MAX_CANDIDATES = 500   # safety cap per run — raise once on paid tier
+RPM_LIMIT = 10         # free tier: 15 RPM; stay under with headroom
 
 
 class Verdict(BaseModel):
@@ -84,8 +87,9 @@ def run() -> list[tuple[int, int, str, str]]:
                     AND mm.market_b = GREATEST(a.id, b.id)
               )
             ORDER BY similarity DESC
+            LIMIT %(limit)s
             """,
-            {"threshold": THRESHOLD},
+            {"threshold": THRESHOLD, "limit": MAX_CANDIDATES},
         ).fetchall()
 
     if not candidates:
@@ -106,6 +110,7 @@ def run() -> list[tuple[int, int, str, str]]:
         print(f"  {status} [{sim:.2f}] {title_a[:50]} / {title_b[:50]}")
         if verdict.same:
             confirmed.append((market_a, market_b, venue_a, venue_b))
+        time.sleep(60 / RPM_LIMIT)  # stay within free-tier RPM cap
 
     print(f"pair_llm: {len(confirmed)}/{len(candidates)} confirmed")
     return confirmed

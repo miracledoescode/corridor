@@ -12,6 +12,10 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", "..", ".en
 
 
 def get_conn() -> psycopg.Connection:
-    conn = psycopg.connect(os.environ["DB_URL"])
+    # WHY prepare_threshold=None: Supabase transaction pooler routes each round
+    # trip to a different backend. psycopg3 prepares statements by default —
+    # prepare lands on backend A, execute hits backend B → DuplicatePreparedStatement.
+    # Same root cause as the Go side, fixed there with QueryExecModeSimpleProtocol.
+    conn = psycopg.connect(os.environ["DB_URL"], prepare_threshold=None)
     register_vector(conn)
     return conn
