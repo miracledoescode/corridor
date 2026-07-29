@@ -1,62 +1,72 @@
 # Corridor
 
-A cross-venue prediction market data layer — ingestion, storage, and event-matching infrastructure for comparing odds across Polymarket, Kalshi, and beyond.
+A cross-venue prediction market data layer — live ingestion, storage, and event-matching infrastructure for comparing odds across Polymarket, Kalshi, and beyond.
 
-**Status: archived / open source.** This was a startup for a while. It isn't anymore. The founder decided to stop pursuing it as a company and is releasing the codebase so others can pick it up, fork it, or just study how it's built.
-
----
-
-## What this actually is
-
-Corridor is a pure data layer — no custody, no execution, no gambling license required. It ingests live quotes from multiple prediction market venues, stores them efficiently, and (in progress) matches equivalent events across venues so you can compare odds on the same real-world question.
-
-Think: the plumbing for "Google Flights for prediction markets," minus the flights UI.
+Think: the plumbing for "Google Flights for prediction markets."
 
 ---
 
-## What's built and working
+## What it does
 
-- **Ingestion spine (complete):** Live ingestion from Polymarket (1,164 markets) and Kalshi (172 markets), ~4s lag, 716K+ quotes captured, running on Postgres/Supabase with pgvector.
-- **Value-deduplication:** 5–20x storage reduction on quote history by only writing on price change.
-- **Row-level security:** RLS policies across all core tables.
-- **Supervised ingestion goroutines:** separate supervision for metadata vs. live quote streams, so one doesn't take down the other.
-- **Kalshi scoping guardrail:** a hard-won lesson — an unscoped sweep once pulled 187K combinatorial markets and crashed ingestion for ~47 hours. The fix is a `scopedSeries` allowlist in `internal/ingest/kalshi/adapter.go`; an empty allowlist refuses to sweep at all. If you extend venue coverage, respect this pattern.
+Corridor ingests live top-of-book quotes from multiple prediction market venues, deduplicates and stores them efficiently, and matches equivalent events across venues so you can compare odds on the same real-world question — and eventually detect arbitrage.
+
+No custody. No execution. No gambling license required.
 
 ---
 
-## What's designed but not finished
+## Status
 
-- **Event-matcher (Phase 2):** Architecture is spec'd — local embeddings prefilter → LLM pair confirmation → resolution-criteria diffing → confidence tiers (EXACT / CHECK-TERMS / RELATED) → permanent match cache with daily human review. Safety property baked into the design: when uncertain, always demote, never auto-promote to EXACT. This matters — a false "these are the same market" match is the single biggest trust risk in this kind of product. If you build this out, keep that property.
-- Historical odds API, spread engine, Telegram alerts, and a 4th venue integration were all designed but never finished.
+| Phase | Scope | Status |
+|---|---|---|
+| 1 — Ingestion spine | Polymarket + Kalshi → Postgres, `/healthz` | ✅ live |
+| 2 — Matching engine | embed → LLM confirm → resolution diff → `market_matches` | 🔨 in progress |
+| 3 — Spread + alerts | Fee/FX-adjusted arb detection, Telegram alerts | 📅 planned |
+| 4 — Web | Static odds-comparison page on Cloudflare Pages | 📅 planned |
+
+**Live numbers (as of July 2026):** 10,500+ markets ingested, 850K+ quotes captured, ~4s lag, Polymarket + Kalshi both running.
 
 ---
 
-## Why it's archived
+## What's built
 
-Short version: no edge, no users, no validation strong enough to justify continuing as a company. The founder ran limited customer discovery and didn't find enough signal that people wanted a cross-venue comparison tool badly enough — most retail prediction market traders appear to stick to one venue. That's a real, if informal, finding — take it as a data point, not gospel, if you're considering building a product on top of this.
+- **Ingestion spine:** Live ingestion from Polymarket (~10,000 markets) and Kalshi (~130 active markets across crypto, US politics, sports, and macro). ~4s lag. Supervised goroutine-per-venue with backoff restarts — one venue failing never affects another.
+- **Value-deduplication:** Quotes are written only on price change, not on every poll. 5–20x storage reduction vs. fixed-interval sampling.
+- **Separate metadata and quote loops:** A slow metadata write can never freeze price capture. Each venue runs two independent supervised goroutines.
+- **Row-level security:** RLS policies on all core tables.
+- **Kalshi scoping guardrail:** An unscoped sweep once pulled 187K combinatorial parlay markets and crashed ingestion for ~47 hours. The fix is a `scopedSeries` allowlist in `internal/ingest/kalshi/adapter.go` — an empty allowlist refuses to sweep entirely. If you add venue coverage, respect this pattern.
+- **Matching pipeline (in progress):** `match/` — sentence-transformers embeddings → cosine prefilter → Gemini Flash LLM confirmation → resolution-criteria diffing → `EXACT / CHECK_TERMS / RELATED` confidence tiers → human review CLI.
 
 ---
 
-## If you want to pick this up
+## The matcher's safety property
 
-The moat, such as it was, was always the ingestion spine plus an EXACT-match event graph accruing over time. Both require always-on infrastructure to be worth anything — a laptop that sleeps doesn't count. If you're serious about extending this, get it on a real always-on host before you invest in anything else.
+When uncertain, always demote. Never auto-promote to `EXACT`.
 
-The matcher's safety property (demote when unsure) is the one design decision worth protecting above all others. Everything else is negotiable.
+A false "these are the same market" match is the single biggest trust risk in this kind of product — it's what would cause a spread engine to advertise a fake arbitrage. The design enforces this at every step: the LLM must affirmatively confirm, the resolution diff must agree, and a human reviews before anything reaches `EXACT`. If you extend the matcher, keep this property.
 
 ---
 
 ## Getting started
 
-**Prerequisites:** Go 1.22+, Docker, `make`
+**Prerequisites:** Go 1.22+, Python 3.12+, Docker, `make`, `uv`
 
 ```bash
 git clone https://github.com/miracledoescode/corridor
 cd corridor
-cp .env.example .env          # fill in your own DB_URL (Supabase or local Postgres)
+cp .env.example .env          # fill in DB_URL (Supabase or local Postgres) + GEMINI_API_KEY
 make up                       # redis sidecar
 make migrate                  # run goose migrations
-make run                      # start corridord
+make run                      # start corridord (ingest + api)
 make verify                   # print venue/market/quote counts
+```
+
+To run the matching pipeline:
+
+```bash
+cd match
+uv sync
+uv run python -m jobs.run_match      # embed → LLM confirm → write market_matches
+uv run python -m matcher.review_queue  # human review CLI (y/n/s/q)
 ```
 
 ---
@@ -76,12 +86,15 @@ corridor/
 │   ├── spread/                # cross-venue math, fees, FX (unfinished)
 │   ├── notify/                # telegram dispatch (unfinished)
 │   └── api/                   # /healthz, /v1/events, /v1/quotes
-├── match/                     # Python matching engine (batch jobs, unfinished)
-│   └── matcher/
-│       ├── embed.py           # sentence-transformers → pgvector
-│       ├── pair_llm.py        # LLM confirm/reject candidate pairs
-│       ├── resolution_diff.py # settlement-rule diffing → confidence tier
-│       └── review_queue.py    # human review CLI
+├── match/                     # Python matching engine (batch jobs)
+│   ├── pyproject.toml         # uv project
+│   ├── matcher/
+│   │   ├── db.py              # shared psycopg3 + pgvector connection
+│   │   ├── embed.py           # sentence-transformers → markets.embedding
+│   │   ├── pair_llm.py        # cosine prefilter → Gemini confirms same event
+│   │   ├── resolution_diff.py # resolution criteria diff → confidence tier
+│   │   └── review_queue.py    # human review CLI
+│   └── jobs/run_match.py      # cron entrypoint (idempotent)
 ├── migrations/                # goose SQL files
 ├── ops/                       # deploy.sh, backup.sh, Caddyfile
 └── web/                       # static frontend placeholder
@@ -96,8 +109,8 @@ Modular monolith. One binary, one database, venue isolation via goroutines.
 ```
 ingest/  → Go     — venue adapters, supervised polling, raw JSONB storage
 match/   → Python — LLM-powered event matching (batch jobs)
-spread/  → Go     — fee + FX adjusted spread engine, arb detection
-notify/  → Go     — Telegram alerts
+spread/  → Go     — fee/FX-adjusted spread engine, arb detection (planned)
+notify/  → Go     — Telegram alerts (planned)
 ```
 
 **Stack:** Go 1.22 · Python 3.12 · PostgreSQL + pgvector · Redis · Docker
@@ -113,11 +126,23 @@ notify/  → Go     — Telegram alerts
 
 ## Venues
 
-| Venue | Region | API |
-|---|---|---|
-| Polymarket | Global | Public (Gamma + CLOB) |
-| Kalshi | US | Public REST |
-| Bayse | Nigeria / Africa | Planned |
+| Venue | Region | API | Status |
+|---|---|---|---|
+| Polymarket | Global | Public (Gamma + CLOB) | ✅ live |
+| Kalshi | US | Public REST | ✅ live |
+| Bayse | Nigeria / Africa | — | 📅 planned |
+
+**Kalshi series in scope:** crypto (BTC), US politics (SCOTUS, debt ceiling, stock trading ban), sports (NBA, NFL, F1, Club World Cup, EPL), macro (Fed), space (Starship). See `scopedSeries` in `internal/ingest/kalshi/adapter.go` to add more — but read the guardrail comment first.
+
+---
+
+## If you want to extend this
+
+The ingestion spine plus an EXACT-match event graph accruing over time is the core asset. Both require always-on infrastructure — a laptop that sleeps doesn't count. Get it on a real host before investing in anything else.
+
+The matcher's safety property (demote when unsure) is the one design decision worth protecting above all others. Everything else is negotiable.
+
+See [`RUNBOOK.md`](./RUNBOOK.md) for the Supabase pooler gotcha, Kalshi host history, and on-call notes. Read it before touching connection code.
 
 ---
 
