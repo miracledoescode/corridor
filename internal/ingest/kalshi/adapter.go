@@ -28,22 +28,35 @@ const (
 	maxPages = 5
 )
 
-// scopedSeries is the v0 allowlist — the structural fix for the
-// 2026-06-15 disk-full incident (166K combinatorial markets in
-// KXMVESPORTSMULTIGAMEEXTENDED + KXMVECROSSCATEGORY filled the disk).
-// Only these series are ingested; everything else is refused.
-//
-// Each series is here because it has a confirmed Polymarket counterpart
-// (winner / top scorer / group winner / advancement) — i.e. it can
-// actually produce a cross-venue arb. Counts verified live 2026-06-15.
-//
-// Hardcoded is fine at v0 (5 series, changes rarely). Move to config/env
-// when scope churn or no-redeploy changes justify it.
+// scopedSeries is the allowlist of Kalshi series to ingest.
+// NEVER add KXMVESPORTSMULTIGAMEEXTENDED or KXMVECROSSCATEGORY — those are
+// combinatorial parlay markets (187K+ rows) that crashed ingestion for 47h.
+// Only simple binary markets with confirmed Polymarket counterparts belong here.
+// Verified live 2026-07-29.
 var scopedSeries = []string{
-	"KXWCSTAGE",      // 35 — furthest stage / winner ↔ "[country] win the World Cup"
-	"KXWCGOALLEADER", // 41 — top scorer             ↔ "[player] top goalscorer"
-	"KXWCGROUPWIN",   // 48 — group winner           ↔ "[country] win Group X"
-	"KXWCGROUPQUAL",  // 48 — advancement            ↔ "advance to knockout stages"
+	// Crypto — clean binary resolution, deep Polymarket overlap
+	"KXBTCY",    // BTC price range end of year
+	"BTCMINMAXY", // BTC min/max yearly
+
+	// US politics / macro
+	"KXSCOURT",      // Next SCOTUS justice
+	"KXPOWELLLEAVE", // Powell leaving Fed
+	"KXDCEIL",       // Debt ceiling
+	"KXTRDBAN",      // Congress stock trading ban
+	"KXIRAREPEAL",   // IRA repeal
+	"KXSCHEDULEF",   // Schedule F
+
+	// Sports — binary winner markets
+	"KXF1RACE",     // F1 race winner
+	"KXNBASERIES",  // NBA series winner
+	"KXNBAPLAYOFF", // NBA playoff qualifier
+	"KXNBACOY",     // NBA coach of the year
+	"KXNFLPLAYOFF", // NFL playoff qualifier
+	"KXCLUBWC",     // Club World Cup
+	"KXEPLTOP4",    // EPL top 4
+
+	// Space / tech
+	"KXSPACEXSTARSHIP", // Starship launch
 }
 
 // Adapter implements ingest.Adapter for Kalshi.
