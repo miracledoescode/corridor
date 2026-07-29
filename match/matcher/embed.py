@@ -51,11 +51,10 @@ def run() -> None:
         )
 
         with conn.cursor() as cur:
-            for market_id, vec in zip(ids, embeddings):
-                cur.execute(
-                    "UPDATE markets SET embedding = %s WHERE id = %s",
-                    (vec, market_id),
-                )
+            cur.executemany(
+                "UPDATE markets SET embedding = %s WHERE id = %s",
+                [(vec, market_id) for market_id, vec in zip(ids, embeddings)],
+            )
         conn.commit()
         print(f"embed: wrote {len(ids)} embeddings")
 
