@@ -11,11 +11,6 @@ Each step skips work that's already done.
 Usage:
     uv run python -m jobs.run_match
 """
-import sys
-import os
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
 from matcher import embed, pair_llm, resolution_diff
 
 

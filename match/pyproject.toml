@@ -6,7 +6,7 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "pgvector>=0.3",
     "sentence-transformers>=3.0",
-    "google-genai>=1.0",
+    "groq>=0.9",
     "pydantic>=2.0",
     "python-dotenv>=1.0",
 ]

@@ -10,18 +10,18 @@ confidence tier:
 Safety property: when uncertain, always demote. Never auto-promote to EXACT.
 A false EXACT is the single biggest trust risk in this product.
 """
+import json
 import os
 from pydantic import BaseModel
-from google import genai
-from google.genai import types
+from groq import Groq
 from .db import get_conn
 
-GEMINI_MODEL = "gemini-2.0-flash"
+GROQ_MODEL = "llama-3.1-8b-instant"
 
 
 class DiffResult(BaseModel):
     confidence: str   # EXACT | CHECK_TERMS | RELATED
-    diff_note: str    # one-line human-readable note
+    diff_note: str
 
 
 SYSTEM = (
@@ -34,11 +34,11 @@ SYSTEM = (
     "  RELATED     — same topic but different questions\n"
     "When uncertain, always choose the lower tier. Never assign EXACT unless you "
     "are certain the resolution rules are equivalent. "
-    "Return only the JSON schema provided."
+    'Respond with JSON matching this schema: {"confidence": string, "diff_note": string}'
 )
 
 
-def _diff(client: genai.Client, a: dict, b: dict) -> DiffResult:
+def _diff(client: Groq, a: dict, b: dict) -> DiffResult:
     prompt = (
         f"Market A ({a['venue']}): {a['title']}\n"
         f"Resolution A: {a['resolution'] or 'not specified'}\n\n"
@@ -46,16 +46,16 @@ def _diff(client: genai.Client, a: dict, b: dict) -> DiffResult:
         f"Resolution B: {b['resolution'] or 'not specified'}\n\n"
         "Assign confidence tier and write a one-line diff note."
     )
-    resp = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM,
-            response_mime_type="application/json",
-            response_schema=DiffResult,
-        ),
+    resp = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": prompt},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0,
     )
-    return DiffResult.model_validate_json(resp.text)
+    return DiffResult.model_validate(json.loads(resp.choices[0].message.content))
 
 
 def run(confirmed_pairs: list[tuple[int, int, str, str]]) -> None:
@@ -63,7 +63,7 @@ def run(confirmed_pairs: list[tuple[int, int, str, str]]) -> None:
     if not confirmed_pairs:
         return
 
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
     with get_conn() as conn:
         markets = {
@@ -89,7 +89,6 @@ def run(confirmed_pairs: list[tuple[int, int, str, str]]) -> None:
                 {"venue": venue_b, "title": b_row[1], "resolution": b_row[2]},
             )
 
-            # Upsert — idempotent if run_match.py is re-run.
             conn.execute(
                 """
                 INSERT INTO market_matches
@@ -103,7 +102,6 @@ def run(confirmed_pairs: list[tuple[int, int, str, str]]) -> None:
                 (market_a, market_b, result.confidence, result.diff_note),
             )
 
-            # Link both markets to a shared event row (create if needed).
             _link_event(conn, market_a, market_b, result.confidence)
 
             print(f"  [{result.confidence}] {a_row[1][:45]} / {b_row[1][:45]}")
@@ -115,24 +113,18 @@ def run(confirmed_pairs: list[tuple[int, int, str, str]]) -> None:
 
 
 def _link_event(conn, market_a: int, market_b: int, confidence: str) -> None:
-    """Ensure both markets share an events row.
-
-    If either market already has an event_id, reuse it.
-    Otherwise create a new event from market_a's title.
-    Only links on EXACT or CHECK_TERMS — RELATED pairs don't share an event.
-    """
     if confidence == "RELATED":
         return
 
-    row = conn.execute(
-        "SELECT event_id, title FROM markets WHERE id = ANY(%s)",
+    rows = conn.execute(
+        "SELECT id, event_id, title FROM markets WHERE id = ANY(%s)",
         ([market_a, market_b],),
     ).fetchall()
 
-    existing_event = next((r[0] for r in row if r[0] is not None), None)
+    existing_event = next((r[1] for r in rows if r[1] is not None), None)
 
     if existing_event is None:
-        title = next(r[1] for r in row if r[0] is None)
+        title = next(r[2] for r in rows)
         result = conn.execute(
             "INSERT INTO events (canonical_title) VALUES (%s) RETURNING id",
             (title,),
