@@ -14,7 +14,9 @@ from groq import Groq
 from .db import get_conn
 
 THRESHOLD = 0.88
-GROQ_MODEL = "llama-3.1-8b-instant"  # 500k TPD free tier; sufficient for binary same/different
+# WHY: Keep the model configurable because Groq retires model IDs and model
+# access can vary by account. The default is a currently supported fallback.
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 MAX_CANDIDATES = 500
 RPM_LIMIT = 20  # conservative to avoid rate limits
 
