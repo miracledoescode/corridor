@@ -16,7 +16,9 @@ from pydantic import BaseModel
 from groq import Groq
 from .db import get_conn
 
-GROQ_MODEL = "llama-3.1-8b-instant"
+# WHY: Keep the model configurable because Groq retires model IDs and model
+# access can vary by account. The default is a currently supported fallback.
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 
 class DiffResult(BaseModel):
