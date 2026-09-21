@@ -5,18 +5,23 @@ import (
 	"testing"
 )
 
-func leg(t *testing.T, venue, ask, coeff string, liquidity int64) Leg {
+// leg builds a test leg. liquidityUSD is dollars of book depth, matching what
+// the adapters actually store; "" means the venue reported none.
+func leg(t *testing.T, venue, ask, coeff, liquidityUSD string) Leg {
 	t.Helper()
-	return Leg{
+	l := Leg{
 		VenueSlug: venue,
 		Ask:       rat(t, ask),
-		Liquidity: liquidity,
 		Fees:      FeeModel{TakerCoefficient: rat(t, coeff)},
 	}
+	if liquidityUSD != "" {
+		l.LiquidityUSD = rat(t, liquidityUSD)
+	}
+	return l
 }
 
 func TestComputeRejectsBadInput(t *testing.T) {
-	good := leg(t, "kalshi", "0.50", "0.07", 100)
+	good := leg(t, "kalshi", "0.50", "0.07", "1000")
 
 	tests := []struct {
 		name    string
@@ -24,17 +29,17 @@ func TestComputeRejectsBadInput(t *testing.T) {
 	}{
 		{
 			name: "same venue is not a cross-venue trade",
-			yes:  leg(t, "kalshi", "0.40", "0.07", 100),
-			no:   leg(t, "kalshi", "0.40", "0.07", 100),
+			yes:  leg(t, "kalshi", "0.40", "0.07", "1000"),
+			no:   leg(t, "kalshi", "0.40", "0.07", "1000"),
 		},
 		{
 			name: "missing ask",
-			yes:  Leg{VenueSlug: "polymarket", Fees: good.Fees, Liquidity: 100},
+			yes:  Leg{VenueSlug: "polymarket", Fees: good.Fees, LiquidityUSD: rat(t, "1000")},
 			no:   good,
 		},
 		{
 			name: "missing fee model",
-			yes:  Leg{VenueSlug: "polymarket", Ask: rat(t, "0.40"), Liquidity: 100},
+			yes:  Leg{VenueSlug: "polymarket", Ask: rat(t, "0.40"), LiquidityUSD: rat(t, "1000")},
 			no:   good,
 		},
 	}
@@ -50,14 +55,14 @@ func TestComputeRejectsBadInput(t *testing.T) {
 
 func TestComputeArbDetection(t *testing.T) {
 	tests := []struct {
-		name        string
-		yesAsk      string
-		noAsk       string
-		yesCoeff    string
-		noCoeff     string
-		liquidity   int64
-		wantArb     bool
-		wantNetEdge string
+		name         string
+		yesAsk       string
+		noAsk        string
+		yesCoeff     string
+		noCoeff      string
+		liquidityUSD string
+		wantArb      bool
+		wantNetEdge  string
 	}{
 		{
 			// 0.45 + 0.50 = 0.95 gross. Fees: 0.07*.45*.55=0.017325 and
@@ -65,7 +70,7 @@ func TestComputeArbDetection(t *testing.T) {
 			name:   "clear arb survives fees",
 			yesAsk: "0.45", noAsk: "0.50",
 			yesCoeff: "0.07", noCoeff: "0.05",
-			liquidity: 100, wantArb: true, wantNetEdge: "0.020175",
+			liquidityUSD: "100000", wantArb: true, wantNetEdge: "0.020175",
 		},
 		{
 			// The case that matters most: gross edge looks positive, fees eat
@@ -75,32 +80,32 @@ func TestComputeArbDetection(t *testing.T) {
 			name:   "thin gross edge is destroyed by fees",
 			yesAsk: "0.49", noAsk: "0.50",
 			yesCoeff: "0.07", noCoeff: "0.05",
-			liquidity: 100, wantArb: false, wantNetEdge: "-0.019993",
+			liquidityUSD: "100000", wantArb: false, wantNetEdge: "-0.019993",
 		},
 		{
 			name:   "exactly 1.00 gross is not an arb",
 			yesAsk: "0.50", noAsk: "0.50",
 			yesCoeff: "0", noCoeff: "0",
-			liquidity: 100, wantArb: false, wantNetEdge: "0",
+			liquidityUSD: "100000", wantArb: false, wantNetEdge: "0",
 		},
 		{
 			name:   "over 1.00 gross is never an arb",
 			yesAsk: "0.55", noAsk: "0.50",
 			yesCoeff: "0", noCoeff: "0",
-			liquidity: 100, wantArb: false, wantNetEdge: "-0.05",
+			liquidityUSD: "100000", wantArb: false, wantNetEdge: "-0.05",
 		},
 		{
 			name:   "zero-fee venues keep the whole gross edge",
 			yesAsk: "0.45", noAsk: "0.50",
 			yesCoeff: "0", noCoeff: "0",
-			liquidity: 100, wantArb: true, wantNetEdge: "0.05",
+			liquidityUSD: "100000", wantArb: true, wantNetEdge: "0.05",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			yes := leg(t, "polymarket", tt.yesAsk, tt.yesCoeff, tt.liquidity)
-			no := leg(t, "kalshi", tt.noAsk, tt.noCoeff, tt.liquidity)
+			yes := leg(t, "polymarket", tt.yesAsk, tt.yesCoeff, tt.liquidityUSD)
+			no := leg(t, "kalshi", tt.noAsk, tt.noCoeff, tt.liquidityUSD)
 
 			got, err := Compute(yes, no)
 			if err != nil {
@@ -119,16 +124,27 @@ func TestComputeArbDetection(t *testing.T) {
 }
 
 // "Never advertise an arb bigger than its book."
+//
+// Liquidity arrives in DOLLARS, so depth converts to contracts by dividing by
+// the price — $450 at 45c is 1000 contracts, not 450.
 func TestComputeCapsSizeAtThinnerBook(t *testing.T) {
 	tests := []struct {
 		name     string
-		yesLiq   int64
-		noLiq    int64
+		yesLiq   string // dollars, at ask 0.45
+		noLiq    string // dollars, at ask 0.50
 		wantSize int64
 	}{
-		{"thinner side is yes", 40, 500, 40},
-		{"thinner side is no", 500, 40, 40},
-		{"equal books", 100, 100, 100},
+		// $450/0.45 = 1000 contracts; $5000/0.50 = 10000. Yes is thinner.
+		{"thinner side is yes", "450", "5000", 1000},
+		// $45000/0.45 = 100000; $1000/0.50 = 2000. No is thinner.
+		{"thinner side is no", "45000", "1000", 2000},
+		// Equal DOLLARS is not equal contracts: $900/0.45 = 2000 but
+		// $900/0.50 = 1800, so the pricier leg binds.
+		{"equal dollars still converts by price", "900", "900", 1800},
+		// Floor, never round up: $100/0.45 = 222.22 -> 222.
+		{"partial contracts are floored", "100", "5000", 222},
+		{"one side dry is unexecutable", "0", "5000", 0},
+		{"both sides dry", "0", "0", 0},
 	}
 
 	for _, tt := range tests {
@@ -155,8 +171,8 @@ func TestComputeCapsSizeAtThinnerBook(t *testing.T) {
 
 // An unfillable edge is not an opportunity, however good the price looks.
 func TestComputeZeroLiquidityIsNeverAnArb(t *testing.T) {
-	yes := leg(t, "polymarket", "0.10", "0", 0)
-	no := leg(t, "kalshi", "0.10", "0", 500)
+	yes := leg(t, "polymarket", "0.10", "0", "")
+	no := leg(t, "kalshi", "0.10", "0", "500")
 
 	got, err := Compute(yes, no)
 	if err != nil {
@@ -173,15 +189,15 @@ func TestComputeZeroLiquidityIsNeverAnArb(t *testing.T) {
 
 // Fees are charged on both legs; forgetting one silently doubles the edge.
 func TestComputeChargesBothLegs(t *testing.T) {
-	both := leg(t, "polymarket", "0.45", "0.07", 100)
-	kalshi := leg(t, "kalshi", "0.50", "0.07", 100)
+	both := leg(t, "polymarket", "0.45", "0.07", "100000")
+	kalshi := leg(t, "kalshi", "0.50", "0.07", "1000")
 
 	withBoth, err := Compute(both, kalshi)
 	if err != nil {
 		t.Fatalf("Compute() unexpected error: %v", err)
 	}
 
-	freeNo := leg(t, "kalshi", "0.50", "0", 100)
+	freeNo := leg(t, "kalshi", "0.50", "0", "100000")
 	withOne, err := Compute(both, freeNo)
 	if err != nil {
 		t.Fatalf("Compute() unexpected error: %v", err)

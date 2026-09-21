@@ -18,9 +18,22 @@ type Leg struct {
 	// price a trade nobody can actually get filled at.
 	Ask *big.Rat
 
-	// Liquidity is the venue-reported depth for this outcome, in contracts.
-	// Zero means "unknown", which is treated as unexecutable.
-	Liquidity int64
+	// LiquidityUSD is the venue-reported liquidity figure, in DOLLARS.
+	//
+	// WHY dollars and not contracts: both adapters populate this from a
+	// dollar-denominated field — Kalshi's liquidity_dollars (or its legacy
+	// cents integer, converted) and Polymarket's Gamma liquidityNum. Treating
+	// it as a contract count would overstate size by a factor of roughly 1/price.
+	//
+	// CAVEAT, and it is a real one: this is a MARKET-level aggregate that the
+	// adapters copy onto every outcome of the market. It is not depth resting
+	// at this ask. quotes carries bid/ask but no size-at-ask, so the data for
+	// a true executable size is not currently ingested. Size derived from this
+	// is therefore an upper-bound ESTIMATE, and callers must present it as
+	// such rather than as a fillable quantity.
+	//
+	// Nil or zero means unknown, which is treated as unexecutable.
+	LiquidityUSD *big.Rat
 
 	Fees FeeModel
 }
@@ -76,13 +89,7 @@ func Compute(yes, no Leg) (Result, error) {
 	// contracts as BOTH sides can fill. Advertising an arb larger than its
 	// book is advertising a trade that cannot be executed — the alert would
 	// be a lie the moment someone tried to take it.
-	size := yes.Liquidity
-	if no.Liquidity < size {
-		size = no.Liquidity
-	}
-	if size < 0 {
-		size = 0
-	}
+	size := estimateSize(yes, no)
 
 	gross := new(big.Rat).Sub(oneRat(), new(big.Rat).Add(yes.Ask, no.Ask))
 
@@ -112,6 +119,36 @@ func Compute(yes, no Leg) (Result, error) {
 	result.TotalProfit = profit
 	result.NetEdge = new(big.Rat).Quo(profit, new(big.Rat).SetInt64(size))
 	return result, nil
+}
+
+// estimateSize converts each leg's dollar liquidity into a contract count and
+// returns the smaller — the most contracts the thinner side could plausibly
+// absorb.
+//
+// Buying C contracts at price P costs C x P dollars, so L dollars of depth
+// supports at most L/P contracts. The result is floored: a partial contract
+// is not tradable, and rounding a size UP would advertise more than the book
+// can take.
+//
+// This is an upper-bound estimate, not a fill guarantee — see Leg.LiquidityUSD
+// for why the underlying figure is a market-level aggregate rather than depth
+// at the ask.
+func estimateSize(yes, no Leg) int64 {
+	y := contractsAffordable(yes)
+	n := contractsAffordable(no)
+	if n < y {
+		return n
+	}
+	return y
+}
+
+func contractsAffordable(l Leg) int64 {
+	if l.LiquidityUSD == nil || l.LiquidityUSD.Sign() <= 0 || l.Ask.Sign() <= 0 {
+		return 0
+	}
+	contracts := new(big.Rat).Quo(l.LiquidityUSD, l.Ask)
+	// Floor of an exact rational: integer division of numerator by denominator.
+	return new(big.Int).Div(contracts.Num(), contracts.Denom()).Int64()
 }
 
 // FloatString renders an exact rational as a fixed-precision decimal string
