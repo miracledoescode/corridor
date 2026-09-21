@@ -20,6 +20,12 @@ type config struct {
 
 	quoteRetentionDays int
 
+	// spreadEvery is how often the arb scan runs. Zero disables the engine,
+	// which is how it ships until the fee models in migration 005 have been
+	// verified against the venues' published schedules — a wrong coefficient
+	// there turns thin spreads into phantom arbs.
+	spreadEvery time.Duration
+
 	polymarketGammaURL string
 	polymarketClobURL  string
 	kalshiBaseURL      string
@@ -39,6 +45,7 @@ func loadConfig() (config, error) {
 		kalshiMetaEvery:     envSeconds("KALSHI_POLL_INTERVAL_S", 60),
 		quoteEvery:          envSeconds("QUOTE_POLL_INTERVAL_S", 10),
 		quoteRetentionDays:  envInt("QUOTE_RETENTION_DAYS", 7),
+		spreadEvery:         envSeconds("SPREAD_SCAN_INTERVAL_S", 0),
 		polymarketGammaURL:  envDefault("POLYMARKET_GAMMA_URL", "https://gamma-api.polymarket.com"),
 		polymarketClobURL:   envDefault("POLYMARKET_CLOB_URL", "https://clob.polymarket.com"),
 		// WHY external-api and not api.elections: Kalshi's docs put
