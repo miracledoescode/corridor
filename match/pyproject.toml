@@ -12,4 +12,10 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = []
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+# WHY pythonpath: tests import the `matcher` package from the match/ root
+# rather than installing it, so pytest has to put match/ on sys.path.
+pythonpath = ["."]
+testpaths = ["tests"]

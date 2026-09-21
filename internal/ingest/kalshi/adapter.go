@@ -35,7 +35,7 @@ const (
 // Verified live 2026-07-29.
 var scopedSeries = []string{
 	// Crypto — clean binary resolution, deep Polymarket overlap
-	"KXBTCY",    // BTC price range end of year
+	"KXBTCY",     // BTC price range end of year
 	"BTCMINMAXY", // BTC min/max yearly
 
 	// US politics / macro
