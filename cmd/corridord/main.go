@@ -17,6 +17,7 @@ import (
 	"github.com/miracledoescode/corridor/internal/ingest"
 	"github.com/miracledoescode/corridor/internal/ingest/kalshi"
 	"github.com/miracledoescode/corridor/internal/ingest/polymarket"
+	"github.com/miracledoescode/corridor/internal/notify"
 	"github.com/miracledoescode/corridor/internal/spread"
 	"github.com/miracledoescode/corridor/internal/store"
 )
@@ -97,6 +98,26 @@ func main() {
 		log.Info("spread engine starting", "interval", cfg.spreadEvery.String())
 	} else {
 		log.Info("spread engine disabled; set SPREAD_SCAN_INTERVAL_S to enable")
+	}
+
+	// Notify is separate from the engine on purpose: the engine can run and
+	// record alerts with delivery switched off, which is how you watch what it
+	// WOULD have sent before letting it message anyone.
+	if cfg.telegramToken != "" {
+		d := notify.NewDispatcher(
+			st,
+			notify.NewTelegram(cfg.telegramToken, log),
+			cfg.telegramProChats,
+			cfg.telegramWatermark,
+			log,
+		)
+		go d.Run(ctx, cfg.notifyEvery)
+		// The count, never the ids: chat ids identify real subscribers.
+		log.Info("notify starting",
+			"interval", cfg.notifyEvery.String(),
+			"pro_subscribers", len(cfg.telegramProChats))
+	} else {
+		log.Info("notify disabled; set TELEGRAM_BOT_TOKEN to enable")
 	}
 
 	srv := api.NewServer(":"+cfg.port, st, sup, log)

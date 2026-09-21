@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
+	"github.com/miracledoescode/corridor/internal/notify"
 	"github.com/miracledoescode/corridor/internal/spread"
 )
 
@@ -129,4 +131,51 @@ func (s *Store) CloseAlertsExcept(ctx context.Context, liveKeys []string) (int64
 		return 0, fmt.Errorf("close stale alerts: %w", err)
 	}
 	return tag.RowsAffected(), nil
+}
+
+// ClaimUndispatchedAlerts stamps dispatched_at on pending alerts and returns
+// them, implementing notify.Store.
+//
+// WHY one UPDATE ... RETURNING rather than SELECT-then-UPDATE: the stamp and
+// the read must be a single atomic step. A SELECT followed by an UPDATE lets
+// two dispatcher ticks (or two processes) read the same pending alert and
+// send it twice. Doing it in one statement means a row is claimed exactly
+// once — the row lock is held for the whole operation.
+//
+// WHY FOR UPDATE SKIP LOCKED: a concurrent claim takes the next available
+// rows instead of blocking on the ones already being claimed.
+//
+// WHY oldest-first: alerts are time-critical, so a backlog drains in the
+// order the opportunities were actually detected.
+func (s *Store) ClaimUndispatchedAlerts(ctx context.Context, limit int) ([]notify.Alert, error) {
+	rows, err := s.pool.Query(ctx, `
+        UPDATE alerts
+        SET dispatched_at = now()
+        WHERE id IN (
+            SELECT id FROM alerts
+            WHERE dispatched_at IS NULL
+            ORDER BY created_at
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING id, kind, payload
+    `, limit)
+	if err != nil {
+		return nil, fmt.Errorf("claim alerts: %w", err)
+	}
+	defer rows.Close()
+
+	var out []notify.Alert
+	for rows.Next() {
+		var a notify.Alert
+		var raw []byte
+		if err := rows.Scan(&a.ID, &a.Kind, &raw); err != nil {
+			return nil, fmt.Errorf("scan alert: %w", err)
+		}
+		if err := json.Unmarshal(raw, &a.Payload); err != nil {
+			return nil, fmt.Errorf("decode alert %d payload: %w", a.ID, err)
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
