@@ -266,7 +266,16 @@ func TestScopedSeriesEmptyPreventsFetch(t *testing.T) {
 	defer srv.Close()
 
 	a := newTestAdapter(t, srv.URL)
-	// scopedSeries is already empty by default
+
+	// WHY this is set explicitly: scopedSeries is a package-level var, and it
+	// was genuinely empty by default when this test was written. Once the
+	// allowlist gained real production entries the test began sweeping those
+	// instead — so it stopped exercising the guardrail it exists to protect
+	// and started failing against its own "no requests" server. The guardrail
+	// in fetchPages was never broken; only this test's premise was.
+	original := scopedSeries
+	scopedSeries = nil
+	defer func() { scopedSeries = original }()
 
 	// FetchMarkets should return no error and no markets
 	markets, err := a.FetchMarkets(context.Background())
