@@ -2,8 +2,9 @@
 
 Run order:
   1. embed      — encode any markets with null embeddings
-  2. pair_llm   — find cross-venue candidates, LLM-confirm
-  3. resolution_diff — diff resolution criteria, write market_matches + events
+  2. index      — ensure the HNSW index pair_llm's k-NN search needs
+  3. pair_llm   — find cross-venue candidates, LLM-confirm
+  4. resolution_diff — diff resolution criteria, write market_matches + events
 
 Idempotent: safe to run on a schedule (cron, GitHub Actions, etc.).
 Each step skips work that's already done.
@@ -11,12 +12,13 @@ Each step skips work that's already done.
 Usage:
     uv run python -m jobs.run_match
 """
-from matcher import embed, pair_llm, resolution_diff
+from matcher import embed, index, pair_llm, resolution_diff
 
 
 def main() -> None:
     print("=== corridor matcher ===")
     embed.run()
+    index.ensure()
     confirmed = pair_llm.run()
     resolution_diff.run(confirmed)
     print("=== done ===")
