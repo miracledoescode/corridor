@@ -56,6 +56,14 @@ class FakeConn:
             if "UPDATE markets SET event_id" in sql and "event_id IS NULL" in sql
         ]
 
+    def alert_repoints(self):
+        """UPDATEs that move alerts off a losing event onto the canonical one."""
+        return [
+            params
+            for sql, params in self.calls
+            if "UPDATE alerts SET event_id" in sql
+        ]
+
 
 def test_related_is_never_linked():
     # RELATED means "same topic, different question" — linking them would
@@ -94,6 +102,25 @@ def test_merges_two_different_existing_events():
     assert not any("INSERT INTO events" in sql for sql in conn.sql_run())
     # Lowest id wins; the markets sitting on event 9 get repointed onto it.
     assert conn.repoints() == [(5, [9])]
+
+
+def test_merge_repoints_dependent_alerts_too():
+    # Moving only the markets would strand any alert already written against
+    # the losing event: alerts.event_id still resolves (the row is kept), so
+    # nothing errors — but the event it points at now holds no markets, and
+    # "show me this alert's markets" silently returns empty.
+    conn = FakeConn([(1, 5, "A"), (2, 9, "B")])
+    _link_event(conn, 1, 2, "EXACT")
+
+    assert conn.alert_repoints() == [(5, [9])]
+
+
+def test_no_alert_repoint_when_nothing_merges():
+    # Nothing moved, so no alert should be touched.
+    conn = FakeConn([(1, 5, "A"), (2, 5, "B")])
+    _link_event(conn, 1, 2, "EXACT")
+
+    assert conn.alert_repoints() == []
 
 
 def test_merge_picks_lowest_event_id_regardless_of_argument_order():

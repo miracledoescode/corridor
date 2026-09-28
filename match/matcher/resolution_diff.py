@@ -148,14 +148,28 @@ def _link_event(conn, market_a: int, market_b: int, confidence: str) -> None:
         # WHY: both markets can already sit in DIFFERENT events, each having
         # been matched to some third market on an earlier run. The UPDATE below
         # only fills NULLs, so without this repoint the two halves of a
-        # confirmed match stay split forever. The losing event row is left in
-        # place rather than deleted — alerts.event_id also references events(id).
+        # confirmed match stay split forever.
         losers = event_ids - {canonical}
         if losers:
             conn.execute(
                 "UPDATE markets SET event_id = %s WHERE event_id = ANY(%s)",
                 (canonical, list(losers)),
             )
+            # WHY alerts move too: alerts.event_id also references events(id).
+            # Moving only the markets leaves an already-dispatched alert
+            # pointing at an event that now holds nothing — the foreign key
+            # still resolves, so nothing errors, but "show me this alert's
+            # markets" silently returns empty. The alert is about the same
+            # real-world event; it just goes by a different id now.
+            conn.execute(
+                "UPDATE alerts SET event_id = %s WHERE event_id = ANY(%s)",
+                (canonical, list(losers)),
+            )
+            # The emptied event row is left in place rather than deleted.
+            # Nothing references it once the two updates above land, but
+            # deleting rows is irreversible and merges are driven by LLM
+            # output — keeping the row costs nothing and makes a bad merge
+            # recoverable.
 
     conn.execute(
         "UPDATE markets SET event_id = %s WHERE id = ANY(%s) AND event_id IS NULL",
