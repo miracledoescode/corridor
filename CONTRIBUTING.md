@@ -21,13 +21,40 @@ review will ask about failure modes more than features.
 
 ## Getting set up
 
+**You need to bring your own database.** `docker-compose.yml` has no Postgres
+service, deliberately: a committed local-database override used to point
+corridord at a throwaway container, which meant a fresh clone could silently
+write the odds-history moat to ephemeral storage. The database is now always
+whatever `DB_URL` says, and nothing overrides it.
+
+It must have **pgvector** — `migrations/001` runs `CREATE EXTENSION vector`
+and `markets.embedding` is `vector(384)`. A plain `postgres` image will fail
+to migrate.
+
+For local development, the quickest throwaway:
+
 ```bash
-cp .env.example .env     # fill in DB_URL at minimum
-make up                  # local Postgres + Redis via docker compose
+docker run -d --name corridor-pg \
+  -e POSTGRES_USER=corridor -e POSTGRES_PASSWORD=corridor \
+  -e POSTGRES_DB=corridor -p 5432:5432 \
+  pgvector/pgvector:pg16
+```
+
+Then:
+
+```bash
+cp .env.example .env
+# set DB_URL=postgres://corridor:corridor@localhost:5432/corridor?sslmode=disable
+make up                  # redis sidecar + corridord container
 make migrate             # apply schema
-make run                 # start corridord
+make run                 # start corridord on the host instead
 make verify              # venue / market / quote counts
 ```
+
+Good news on credentials: **ingestion needs none.** Both venue adapters read
+public, keyless endpoints. Only the matcher needs a key (`GROQ_API_KEY`, free
+tier is enough), and only the Telegram notifier needs a bot token — both are
+optional and off by default.
 
 The Python matcher is a separate, batch-only component:
 

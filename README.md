@@ -50,15 +50,30 @@ A false "these are the same market" match is the single biggest trust risk in th
 
 **Prerequisites:** Go 1.22+, Python 3.12+, Docker, `make`, `uv`
 
+**You bring the database.** There is no Postgres in `docker-compose.yml` (see
+[Getting set up](./CONTRIBUTING.md#getting-set-up) for why), and it must have
+**pgvector** — the schema creates the extension and `markets.embedding` is
+`vector(384)`. A Supabase project works; so does a throwaway container:
+
+```bash
+docker run -d --name corridor-pg \
+  -e POSTGRES_USER=corridor -e POSTGRES_PASSWORD=corridor \
+  -e POSTGRES_DB=corridor -p 5432:5432 \
+  pgvector/pgvector:pg16
+```
+
 ```bash
 git clone https://github.com/miracledoescode/corridor
 cd corridor
-cp .env.example .env          # fill in DB_URL (Supabase or local Postgres) + GEMINI_API_KEY
+cp .env.example .env          # set DB_URL; ingestion needs no other credentials
 make up                       # redis sidecar
 make migrate                  # run goose migrations
 make run                      # start corridord (ingest + api)
 make verify                   # print venue/market/quote counts
 ```
+
+Ingestion needs **no API keys** — both venue adapters read public, keyless
+endpoints. A `GROQ_API_KEY` (free tier) is needed only for the matcher below.
 
 To run the matching pipeline:
 
