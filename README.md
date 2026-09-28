@@ -146,6 +146,16 @@ See [`RUNBOOK.md`](./RUNBOOK.md) for the Supabase pooler gotcha, Kalshi host his
 
 ---
 
+## Contributing
+
+The contribution most wanted here is **a new venue adapter** — Corridor is only as useful as the number of venues it can compare, and an adapter is a self-contained job behind a four-method interface.
+
+See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the setup, the adapter contract, and the rules that exist because breaking them caused a real outage (prices are strings, sweeps fail closed, re-runs never duplicate).
+
+Found a vulnerability or an exposed credential? Please report it privately — see [`SECURITY.md`](./SECURITY.md).
+
+---
+
 ## License
 
 MIT
