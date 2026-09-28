@@ -1,0 +1,125 @@
+# CI for Corridor.
+#
+# WHY this exists at all: the prime directive is that ingestion never goes
+# down, and the contribution most wanted from outside is a new venue adapter —
+# code that runs inside the ingestion loops. Merging that on a maintainer's
+# reading alone is the risk this workflow removes.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push supersedes the run in flight for the same ref. Nobody needs the
+# results of a commit that has already been replaced.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # WHY go-version-file and not a literal: the toolchain version lives
+          # in go.mod already. Pinning it twice means one of them goes stale.
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        # gofmt -l prints files needing formatting and exits 0 either way, so
+        # the empty check is what actually fails the job.
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        # The store integration test skips itself unless TEST_DB_URL is set,
+        # so the suite is green without any database. See the "integration"
+        # job below for the run that does use one.
+        run: go test -race ./...
+
+  python:
+    name: Python matcher
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: match
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: match/uv.lock
+
+      # WHY --locked: it fails when uv.lock and pyproject.toml disagree rather
+      # than silently re-resolving. A lockfile that drifts from the manifest is
+      # how "works on my machine" starts.
+      #
+      # This step is slower than it looks: the matcher depends on
+      # sentence-transformers, which pulls torch. The uv cache above makes
+      # everything after the first run cheap.
+      - name: uv sync
+        run: uv sync --locked
+
+      - name: pytest
+        run: uv run pytest
+
+  integration:
+    name: Store integration (Postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # pgvector/pgvector rather than plain postgres: migrations/001 does
+        # CREATE EXTENSION vector, and markets.embedding is vector(384).
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: corridor
+          POSTGRES_PASSWORD: corridor
+          POSTGRES_DB: corridor
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # WHY this job is separate from the Go one: it is the only thing here
+      # that needs infrastructure. Keeping it apart means a flaky container
+      # start can never be mistaken for a real test failure in the fast job.
+      # The whole store package, not a -run filter on the one test that
+      # exists today: a name filter silently runs nothing the moment a test
+      # is renamed or a second one is added, and a job that passes by testing
+      # nothing is worse than no job. TestIdempotentIngest calls Migrate()
+      # itself, so an empty database is the correct starting point.
+      - name: go test (with database)
+        env:
+          TEST_DB_URL: postgres://corridor:corridor@localhost:5432/corridor?sslmode=disable
+        run: go test ./internal/store/ -v

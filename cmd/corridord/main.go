@@ -1,5 +1,5 @@
-// corridord is the one Corridor binary: ingestion supervisor + API.
-// Phase 1 wires ingest and /healthz; spread and notify arrive in Phase 3.
+// corridord is the one Corridor binary: ingestion supervisor + spread
+// engine + API. Notify (Telegram) is the remaining Phase 3 piece.
 package main
 
 import (
@@ -17,6 +17,8 @@ import (
 	"github.com/miracledoescode/corridor/internal/ingest"
 	"github.com/miracledoescode/corridor/internal/ingest/kalshi"
 	"github.com/miracledoescode/corridor/internal/ingest/polymarket"
+	"github.com/miracledoescode/corridor/internal/notify"
+	"github.com/miracledoescode/corridor/internal/spread"
 	"github.com/miracledoescode/corridor/internal/store"
 )
 
@@ -79,6 +81,44 @@ func main() {
 	// odds history becomes the product (data API), revisit retention + a Pro
 	// storage tier.
 	go runRetention(ctx, st, cfg.quoteRetentionDays, log)
+
+	// The spread engine is a third supervised concern, isolated from ingestion
+	// the same way retention is: its own goroutine, its own failures, logged
+	// and never fatal. It reads matched markets and writes alerts; it never
+	// touches the venue loops, so a slow or failing scan cannot stall quote
+	// capture.
+	//
+	// WHY opt-in rather than on by default: it only produces trustworthy
+	// numbers once venues.fee_model holds verified coefficients. Defaulting it
+	// off means a deploy cannot start emitting arb alerts computed from
+	// unverified fees.
+	if cfg.spreadEvery > 0 {
+		eng := spread.NewEngine(st, st, log)
+		go eng.Run(ctx, cfg.spreadEvery)
+		log.Info("spread engine starting", "interval", cfg.spreadEvery.String())
+	} else {
+		log.Info("spread engine disabled; set SPREAD_SCAN_INTERVAL_S to enable")
+	}
+
+	// Notify is separate from the engine on purpose: the engine can run and
+	// record alerts with delivery switched off, which is how you watch what it
+	// WOULD have sent before letting it message anyone.
+	if cfg.telegramToken != "" {
+		d := notify.NewDispatcher(
+			st,
+			notify.NewTelegram(cfg.telegramToken, log),
+			cfg.telegramProChats,
+			cfg.telegramWatermark,
+			log,
+		)
+		go d.Run(ctx, cfg.notifyEvery)
+		// The count, never the ids: chat ids identify real subscribers.
+		log.Info("notify starting",
+			"interval", cfg.notifyEvery.String(),
+			"pro_subscribers", len(cfg.telegramProChats))
+	} else {
+		log.Info("notify disabled; set TELEGRAM_BOT_TOKEN to enable")
+	}
 
 	srv := api.NewServer(":"+cfg.port, st, sup, log)
 	go func() {

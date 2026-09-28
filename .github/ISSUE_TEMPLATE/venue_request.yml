@@ -1,0 +1,66 @@
+name: Venue request
+description: Propose a prediction-market venue for Corridor to ingest
+title: "venue: "
+labels: ["venue"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Corridor gets more useful with every venue it can compare. Adapters
+        are self-contained — see [CONTRIBUTING.md](https://github.com/miracledoescode/corridor/blob/main/CONTRIBUTING.md) if
+        you want to write this one yourself.
+
+  - type: input
+    id: venue
+    attributes:
+      label: Venue
+      placeholder: e.g. Manifold, Metaculus, PredictIt
+    validations:
+      required: true
+
+  - type: input
+    id: api
+    attributes:
+      label: API documentation
+      description: Link to the public API docs.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: auth
+    attributes:
+      label: Does the market-data API need credentials?
+      options:
+        - "No — public/keyless endpoints"
+        - "Yes — API key or account required"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: scale
+    attributes:
+      label: Roughly how many markets does it list?
+      description: >-
+        An order of magnitude is fine. This matters because an unscoped sweep
+        of a venue with a combinatorial market space once took ingestion down
+        for ~47 hours — a venue that can enumerate hundreds of thousands of
+        markets needs an allowlist from day one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: terms
+    attributes:
+      label: Anything notable in its terms of service?
+      description: >-
+        Particularly around automated access, rate limits, or what may be done
+        with the data. Link the relevant clause if you know it. "Haven't
+        checked" is an honest answer.
+
+  - type: checkboxes
+    id: offer
+    attributes:
+      label: Would you like to write the adapter?
+      options:
+        - label: I'd like to implement this myself

@@ -12,6 +12,7 @@ A false EXACT is the single biggest trust risk in this product.
 """
 import json
 import os
+import time
 from pydantic import BaseModel
 from groq import Groq
 from .db import get_conn
@@ -19,6 +20,7 @@ from .db import get_conn
 # WHY: Keep the model configurable because Groq retires model IDs and model
 # access can vary by account. The default is a currently supported fallback.
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+RPM_LIMIT = 20  # conservative to avoid rate limits, same as pair_llm.py
 
 
 class DiffResult(BaseModel):
@@ -79,6 +81,10 @@ def run(confirmed_pairs: list[tuple[int, int, str, str]]) -> None:
                 {"ids": list({id for pair in confirmed_pairs for id in pair[:2]})},
             ).fetchall()
         }
+        # WHY: close the read transaction before the LLM loop. The Supabase
+        # transaction pooler reclaims connections left idle in a transaction,
+        # and each _diff() call below blocks for seconds.
+        conn.commit()
 
         written = 0
         for market_a, market_b, venue_a, venue_b in confirmed_pairs:
@@ -106,11 +112,16 @@ def run(confirmed_pairs: list[tuple[int, int, str, str]]) -> None:
 
             _link_event(conn, market_a, market_b, result.confidence)
 
+            # WHY: commit per pair so a failure partway through keeps the work
+            # already done. run_match.py is a cron entrypoint — a partial run
+            # must be resumable, not all-or-nothing.
+            conn.commit()
+
             print(f"  [{result.confidence}] {a_row[1][:45]} / {b_row[1][:45]}")
             print(f"    {result.diff_note}")
             written += 1
+            time.sleep(60 / RPM_LIMIT)
 
-        conn.commit()
         print(f"resolution_diff: wrote {written} match rows")
 
 
@@ -123,17 +134,44 @@ def _link_event(conn, market_a: int, market_b: int, confidence: str) -> None:
         ([market_a, market_b],),
     ).fetchall()
 
-    existing_event = next((r[1] for r in rows if r[1] is not None), None)
+    event_ids = {r[1] for r in rows if r[1] is not None}
 
-    if existing_event is None:
+    if not event_ids:
         title = next(r[2] for r in rows)
         result = conn.execute(
             "INSERT INTO events (canonical_title) VALUES (%s) RETURNING id",
             (title,),
         ).fetchone()
-        existing_event = result[0]
+        canonical = result[0]
+    else:
+        canonical = min(event_ids)
+        # WHY: both markets can already sit in DIFFERENT events, each having
+        # been matched to some third market on an earlier run. The UPDATE below
+        # only fills NULLs, so without this repoint the two halves of a
+        # confirmed match stay split forever.
+        losers = event_ids - {canonical}
+        if losers:
+            conn.execute(
+                "UPDATE markets SET event_id = %s WHERE event_id = ANY(%s)",
+                (canonical, list(losers)),
+            )
+            # WHY alerts move too: alerts.event_id also references events(id).
+            # Moving only the markets leaves an already-dispatched alert
+            # pointing at an event that now holds nothing — the foreign key
+            # still resolves, so nothing errors, but "show me this alert's
+            # markets" silently returns empty. The alert is about the same
+            # real-world event; it just goes by a different id now.
+            conn.execute(
+                "UPDATE alerts SET event_id = %s WHERE event_id = ANY(%s)",
+                (canonical, list(losers)),
+            )
+            # The emptied event row is left in place rather than deleted.
+            # Nothing references it once the two updates above land, but
+            # deleting rows is irreversible and merges are driven by LLM
+            # output — keeping the row costs nothing and makes a bad merge
+            # recoverable.
 
     conn.execute(
         "UPDATE markets SET event_id = %s WHERE id = ANY(%s) AND event_id IS NULL",
-        (existing_event, [market_a, market_b]),
+        (canonical, [market_a, market_b]),
     )

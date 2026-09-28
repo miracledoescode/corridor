@@ -1,0 +1,74 @@
+name: Bug report
+description: Something behaves differently from how it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ⚠️ **Not for security issues.** If this involves a vulnerability or an
+        exposed credential, please use
+        [private reporting](https://github.com/miracledoescode/corridor/security/advisories/new)
+        instead — see [SECURITY.md](https://github.com/miracledoescode/corridor/blob/main/SECURITY.md).
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed
+      description: What happened. Include exact output or logs.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+      description: What should have happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: The steps or command that trigger it.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - "Ingestion (corridord / venue adapters)"
+        - "Matcher (Python, match/)"
+        - "Spread engine"
+        - "Notify / Telegram"
+        - "API"
+        - "Migrations / schema"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: ingestion
+    attributes:
+      label: Impact
+      options:
+        - label: This stopped or degraded quote ingestion
+          required: false
+
+  - type: textarea
+    id: version
+    attributes:
+      label: Version
+      description: Commit SHA, plus Go or Python version if relevant.
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: >-
+        Redact before pasting. Logs can contain your DB_URL, venue
+        credentials, or bot token — replace them rather than posting them.
+      render: shell

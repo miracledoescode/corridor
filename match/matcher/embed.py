@@ -63,8 +63,12 @@ def run() -> None:
                     )
                 chunk_conn.commit()
                 written += len(chunk)
-            except Exception:
+            except Exception as exc:
+                # WHY: a swallowed failure here looks identical to "nothing to
+                # encode" on the next run, so the chunk silently never persists.
+                # Keep going (other chunks are independent) but say what broke.
                 chunk_conn.rollback()
+                print(f"embed: chunk at offset {i} failed: {exc}")
     print(f"embed: wrote {written} embeddings")
 
 

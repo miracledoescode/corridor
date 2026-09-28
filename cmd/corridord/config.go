@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -19,6 +20,19 @@ type config struct {
 	quoteEvery          time.Duration
 
 	quoteRetentionDays int
+
+	// spreadEvery is how often the arb scan runs. Zero disables the engine,
+	// which is how it ships until the fee models in migration 005 have been
+	// verified against the venues' published schedules — a wrong coefficient
+	// there turns thin spreads into phantom arbs.
+	spreadEvery time.Duration
+
+	// Telegram delivery. An empty token disables notify entirely, so the
+	// engine can run and write alerts without pushing them anywhere.
+	telegramToken     string
+	telegramProChats  []string
+	telegramWatermark string
+	notifyEvery       time.Duration
 
 	polymarketGammaURL string
 	polymarketClobURL  string
@@ -39,6 +53,11 @@ func loadConfig() (config, error) {
 		kalshiMetaEvery:     envSeconds("KALSHI_POLL_INTERVAL_S", 60),
 		quoteEvery:          envSeconds("QUOTE_POLL_INTERVAL_S", 10),
 		quoteRetentionDays:  envInt("QUOTE_RETENTION_DAYS", 7),
+		spreadEvery:         envSeconds("SPREAD_SCAN_INTERVAL_S", 0),
+		telegramToken:       os.Getenv("TELEGRAM_BOT_TOKEN"),
+		telegramProChats:    envList("TELEGRAM_PRO_CHAT_IDS"),
+		telegramWatermark:   envDefault("TELEGRAM_WATERMARK", "corridor.app"),
+		notifyEvery:         envSeconds("NOTIFY_INTERVAL_S", 15),
 		polymarketGammaURL:  envDefault("POLYMARKET_GAMMA_URL", "https://gamma-api.polymarket.com"),
 		polymarketClobURL:   envDefault("POLYMARKET_CLOB_URL", "https://clob.polymarket.com"),
 		// WHY external-api and not api.elections: Kalshi's docs put
@@ -95,4 +114,21 @@ func envSeconds(key string, def int) time.Duration {
 		return time.Duration(def) * time.Second
 	}
 	return time.Duration(n) * time.Second
+}
+
+// envList reads a comma-separated list, dropping blanks and surrounding
+// whitespace so a trailing comma or a copy-pasted "a, b" does not become an
+// empty chat id the dispatcher would then try to send to.
+func envList(key string) []string {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
